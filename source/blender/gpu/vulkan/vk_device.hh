@@ -519,27 +519,33 @@ class VKDevice : public NonCopyable {
    * on first use, which happens through the `const VKDevice &` handed to the drawing paths; it
    * does not change the observable state of the device.
    *
+   * Atomic because the drawing paths that fill it can run on several threads, while the cache is
+   * shared. Entries are published with a release store and read with an acquire load, so a non-null
+   * pointer is always a fully initialized resource; guarding only the store with a mutex would
+   * leave the unsynchronized reads racing.
+   *
    * `eGPUTextureType` is a bit mask, so the second dimension is not indexed by the raw enum value
    * but by the dense slot assigned in `vk_device.cc`; see `DUMMY_TEXTURE_TYPES`. The count has to
    * stay in sync with that table, which a `static_assert` in the implementation enforces.
    */
-  mutable std::array<GPUTexture *, size_t(GPU_SAMPLER_TYPE_MAX) * DUMMY_TEXTURE_TYPE_COUNT>
-      dummy_textures_ = {};
+  using DummyTextureArray = std::array<std::atomic<GPUTexture *>,
+                                       size_t(GPU_SAMPLER_TYPE_MAX) * DUMMY_TEXTURE_TYPE_COUNT>;
+  mutable DummyTextureArray dummy_textures_ = {};
 
   /**
    * Vertex buffers backing the buffer-type placeholders, one per sampler format. They are kept
    * alive for the device lifetime because `GPU_texture_create_from_vertbuf` wraps the buffer
-   * rather than copying it.
+   * rather than copying it. Only ever touched while `dummy_resources_mutex_` is held.
    */
   mutable std::array<blender::gpu::VertBuf *, size_t(GPU_SAMPLER_TYPE_MAX)> dummy_buffer_textures_ =
       {};
 
   /**
-   * Cached storage and uniform placeholder buffers. `mutable` for the same reason as the texture
+   * Cached storage and uniform placeholder buffers. Atomic for the same reason as the texture
    * cache.
    */
-  mutable VKBuffer *dummy_storage_buffer_ = nullptr;
-  mutable VKBuffer *dummy_uniform_buffer_ = nullptr;
+  mutable std::atomic<VKBuffer *> dummy_storage_buffer_ = nullptr;
+  mutable std::atomic<VKBuffer *> dummy_uniform_buffer_ = nullptr;
 
   /* During initialization the backend requires access to update the workarounds. */
   friend VKBackend;

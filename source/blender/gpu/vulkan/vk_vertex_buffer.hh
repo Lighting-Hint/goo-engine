@@ -10,6 +10,8 @@
 
 #include "GPU_vertex_buffer.hh"
 
+#include <mutex>
+
 #include "vk_buffer.hh"
 #include "vk_data_conversion.hh"
 
@@ -19,6 +21,11 @@ class VKVertexBuffer : public VertBuf {
   VKBuffer buffer_;
   /** When a vertex buffer is used as a UNIFORM_TEXEL_BUFFER the buffer requires a buffer view. */
   VkBufferView vk_buffer_view_ = VK_NULL_HANDLE;
+  /**
+   * Guards the lazy creation of `vk_buffer_view_`, which a drawing path can reach from several
+   * threads at once. Without it two threads would each create a view and leak one of them.
+   */
+  std::once_flag vk_buffer_view_once_;
 
   VertexFormatConverter vertex_format_converter;
   bool data_uploaded_ = false;

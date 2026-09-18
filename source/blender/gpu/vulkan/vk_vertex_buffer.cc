@@ -43,21 +43,22 @@ void VKVertexBuffer::ensure_updated()
 
 void VKVertexBuffer::ensure_buffer_view()
 {
-  if (vk_buffer_view_ != VK_NULL_HANDLE) {
-    return;
-  }
+  /* Callers can reach this from several threads at once, so the creation has to happen exactly
+   * once. `vk_buffer_view_get()` is only ever called after this returns, so the flag also acts as
+   * the publication point for `vk_buffer_view_`. */
+  std::call_once(vk_buffer_view_once_, [this]() {
+    VkBufferViewCreateInfo buffer_view_info = {};
+    eGPUTextureFormat texture_format = to_texture_format(&format);
 
-  VkBufferViewCreateInfo buffer_view_info = {};
-  eGPUTextureFormat texture_format = to_texture_format(&format);
+    buffer_view_info.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
+    buffer_view_info.buffer = buffer_.vk_handle();
+    buffer_view_info.format = to_vk_format(texture_format);
+    buffer_view_info.range = buffer_.size_in_bytes();
 
-  buffer_view_info.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
-  buffer_view_info.buffer = buffer_.vk_handle();
-  buffer_view_info.format = to_vk_format(texture_format);
-  buffer_view_info.range = buffer_.size_in_bytes();
-
-  const VKDevice &device = VKBackend::get().device;
-  vkCreateBufferView(device.vk_handle(), &buffer_view_info, nullptr, &vk_buffer_view_);
-  debug::object_label(vk_buffer_view_, "VertexBufferView");
+    const VKDevice &device = VKBackend::get().device;
+    vkCreateBufferView(device.vk_handle(), &buffer_view_info, nullptr, &vk_buffer_view_);
+    debug::object_label(vk_buffer_view_, "VertexBufferView");
+  });
 }
 
 void VKVertexBuffer::wrap_handle(uint64_t /*handle*/)

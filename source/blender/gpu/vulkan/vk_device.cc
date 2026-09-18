@@ -47,20 +47,21 @@ void VKDevice::deinit()
   deinit_submission_pool();
 
   dummy_buffer.free();
-  if (dummy_storage_buffer_ != nullptr) {
-    dummy_storage_buffer_->free();
-    delete dummy_storage_buffer_;
+  if (VKBuffer *storage_buffer = dummy_storage_buffer_.load()) {
+    storage_buffer->free();
+    delete storage_buffer;
     dummy_storage_buffer_ = nullptr;
   }
-  if (dummy_uniform_buffer_ != nullptr) {
-    dummy_uniform_buffer_->free();
-    delete dummy_uniform_buffer_;
+  if (VKBuffer *uniform_buffer = dummy_uniform_buffer_.load()) {
+    uniform_buffer->free();
+    delete uniform_buffer;
     dummy_uniform_buffer_ = nullptr;
   }
-  for (GPUTexture *&dummy_texture : dummy_textures_) {
+  for (std::atomic<GPUTexture *> &dummy_texture_slot : dummy_textures_) {
+    GPUTexture *dummy_texture = dummy_texture_slot.load();
     if (dummy_texture != nullptr) {
       GPU_texture_free(dummy_texture);
-      dummy_texture = nullptr;
+      dummy_texture_slot = nullptr;
     }
   }
   for (VertBuf *&dummy_vertex_buffer : dummy_buffer_textures_) {
@@ -301,16 +302,19 @@ GPUTexture *VKDevice::dummy_texture_get(eGPUTextureType type,
 {
   const size_t cache_index = size_t(sampler_format) * DUMMY_TEXTURE_TYPES.size() +
                              to_dummy_texture_index(type);
-  GPUTexture *dummy_tex = dummy_textures_[cache_index];
+  /* The cache is shared between threads, so both the lookup and the publication have to be
+   * synchronized. A plain pointer read outside the lock would race with the store below, and could
+   * observe the entry before the texture it points at is fully constructed. An acquire load pairs
+   * with the release store at the end of this function, so a non-null result is always a fully
+   * initialized texture. */
+  GPUTexture *dummy_tex = dummy_textures_[cache_index].load(std::memory_order_acquire);
   if (dummy_tex != nullptr) {
     return dummy_tex;
   }
 
-  /* The cache is shared between threads, so creation is serialized. Lookups above stay lock free,
-   * which keeps the common case (an entry that already exists) off the critical section. */
   std::scoped_lock lock(*dummy_resources_mutex_);
   /* Another thread may have created the entry while this one was waiting for the lock. */
-  dummy_tex = dummy_textures_[cache_index];
+  dummy_tex = dummy_textures_[cache_index].load(std::memory_order_relaxed);
   if (dummy_tex != nullptr) {
     return dummy_tex;
   }
@@ -381,7 +385,8 @@ GPUTexture *VKDevice::dummy_texture_get(eGPUTextureType type,
       return nullptr;
   }
 
-  dummy_textures_[cache_index] = dummy_tex;
+  /* Release so that the texture is fully constructed before any thread can observe the entry. */
+  dummy_textures_[cache_index].store(dummy_tex, std::memory_order_release);
   return dummy_tex;
 }
 
@@ -439,10 +444,10 @@ VkBufferView VKDevice::dummy_texel_buffer_view_get(eGPUSamplerFormat sampler_for
   if (vertex_buffer == nullptr) {
     return VK_NULL_HANDLE;
   }
-  /* Deliberately outside the lock: `ensure_updated()` and `ensure_buffer_view()` submit work
-   * through the render graph, which must not run while holding `dummy_resources_mutex_`. The
-   * vertex buffer is cached on the device and stays valid, so this is safe to do unlocked -- the
-   * worst case is two threads uploading the same buffer, which is idempotent. */
+  /* Both calls are made outside the lock, because `ensure_updated()` allocates the buffer and may
+   * submit a copy through the render graph, which must not happen while holding
+   * `dummy_resources_mutex_`. The buffer itself is device cached, and `ensure_buffer_view()` is
+   * `call_once` guarded, so neither call needs the placeholder cache mutex. */
   VKVertexBuffer *vk_vertex_buffer = unwrap(vertex_buffer);
   vk_vertex_buffer->ensure_updated();
   vk_vertex_buffer->ensure_buffer_view();
@@ -451,7 +456,7 @@ VkBufferView VKDevice::dummy_texel_buffer_view_get(eGPUSamplerFormat sampler_for
 
 VkBuffer VKDevice::dummy_buffer_get(VkDescriptorType vk_descriptor_type) const
 {
-  VKBuffer **cached = nullptr;
+  std::atomic<VKBuffer *> *cached = nullptr;
   VkBufferUsageFlags usage = 0;
   switch (vk_descriptor_type) {
     case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
@@ -467,21 +472,22 @@ VkBuffer VKDevice::dummy_buffer_get(VkDescriptorType vk_descriptor_type) const
       return VK_NULL_HANDLE;
   }
 
-  if (*cached != nullptr) {
-    return (*cached)->vk_handle();
+  /* Same acquire/release publication as the texture cache; a plain read here would race with the
+   * store below. */
+  VKBuffer *dummy_buffer = cached->load(std::memory_order_acquire);
+  if (dummy_buffer != nullptr) {
+    return dummy_buffer->vk_handle();
   }
 
-  /* Creation is serialized for the same reason as the texture cache; the lookup above stays lock
-   * free. `VKBuffer::create()` only issues `vkCreateBuffer`/`vkAllocateMemory`, so it is safe to
-   * run inside the critical section. */
   std::scoped_lock lock(*dummy_resources_mutex_);
-  if (*cached != nullptr) {
-    return (*cached)->vk_handle();
+  dummy_buffer = cached->load(std::memory_order_relaxed);
+  if (dummy_buffer != nullptr) {
+    return dummy_buffer->vk_handle();
   }
 
   /* Host visible so the contents are defined without a transfer; the size only has to satisfy the
    * descriptor, which is never expected to be read through. */
-  VKBuffer *dummy_buffer = new VKBuffer();
+  dummy_buffer = new VKBuffer();
   if (!dummy_buffer->create(1024,
                             usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
@@ -490,7 +496,7 @@ VkBuffer VKDevice::dummy_buffer_get(VkDescriptorType vk_descriptor_type) const
     delete dummy_buffer;
     return VK_NULL_HANDLE;
   }
-  *cached = dummy_buffer;
+  cached->store(dummy_buffer, std::memory_order_release);
   return dummy_buffer->vk_handle();
 }
 
