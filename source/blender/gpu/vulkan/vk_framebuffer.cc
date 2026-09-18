@@ -663,8 +663,13 @@ void VKFrameBuffer::rendering_ensure_render_pass(VKContext &context)
     depth_attachment_reference.attachment = attachment_reference + 1;
 
     VkAttachmentDescription vk_attachment_description = {};
-vk_attachment_description.format = image_view.is_valid() ? image_view.vk_format() :
-                                                      to_vk_format(color_texture.device_format_get());
+    /* A description is appended for every slot so the references keep matching. An unused slot
+     * is never consumed by the subpass (its reference is `VK_ATTACHMENT_UNUSED`), but the format
+     * is kept concrete anyway: the description describes the view the slot would use, and an
+     * undefined format has no meaning here that a valid one wouldn't cover. */
+    vk_attachment_description.format = image_view.is_valid() ?
+                                           image_view.vk_format() :
+                                           to_vk_format(color_texture.device_format_get());
     vk_attachment_description.samples = VK_SAMPLE_COUNT_1_BIT;
     vk_attachment_description.initialLayout = vk_image_layout;
     vk_attachment_description.finalLayout = vk_image_layout;

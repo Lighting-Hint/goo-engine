@@ -129,7 +129,13 @@ void VKVertexBuffer::release_data()
     }
   }
 
-  MEM_SAFE_FREE(data_);
+  /* Freeing `data_` under the upload lock: `upload_data()` reads and converts `data_` and can be
+   * running on another thread (the shared dummy buffers reach it concurrently), while this frees
+   * the memory it works on. */
+  {
+    std::scoped_lock lock(upload_mutex_);
+    MEM_SAFE_FREE(data_);
+  }
 }
 
 void VKVertexBuffer::upload_data_direct(const VKBuffer &host_buffer)
