@@ -247,8 +247,7 @@ void VKDescriptorSetTracker::bind_texture_resource(const VKDevice &device,
     case BindSpaceTextures::Type::VertexBuffer: {
       VKVertexBuffer *vertex_buffer = static_cast<VKVertexBuffer *>(elem.resource);
       vertex_buffer->ensure_updated();
-      vertex_buffer->ensure_buffer_view();
-      bind_texel_buffer(vertex_buffer->vk_buffer_view_get(), resource_binding.location);
+      bind_texel_buffer(vertex_buffer->ensure_and_get_buffer_view(), resource_binding.location);
       access_info.buffers.append({vertex_buffer->vk_handle(), resource_binding.access_mask});
       break;
     }
@@ -260,8 +259,7 @@ void VKDescriptorSetTracker::bind_texture_resource(const VKDevice &device,
         /* TODO: Investigate if this can be improved in the API. */
         VKVertexBuffer *vertex_buffer = texture->source_buffer_;
         vertex_buffer->ensure_updated();
-        vertex_buffer->ensure_buffer_view();
-        bind_texel_buffer(vertex_buffer->vk_buffer_view_get(), resource_binding.location);
+        bind_texel_buffer(vertex_buffer->ensure_and_get_buffer_view(), resource_binding.location);
         access_info.buffers.append({vertex_buffer->vk_handle(), resource_binding.access_mask});
       }
       else {

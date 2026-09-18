@@ -854,8 +854,7 @@ void VKFrameBuffer::rendering_ensure_render_pass(VKContext &context)
   }
 }
 
-void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
-                                                       const VKWorkarounds &workarounds)
+void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context)
 {
   const VKDevice &device = VKBackend::get().device;
   const bool supports_local_read = !device.workarounds_get().dynamic_rendering_local_read;
@@ -923,11 +922,26 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
         vk_image_view = image_view.vk_handle();
         vk_format = image_view.vk_format();
       }
+      else {
+        /* The view is created against the image of `color_texture`, so it fails for the same
+         * textures, and it can also fail on its own parameters. A write state cannot be combined
+         * with a null view, so the attachment is treated as unused, matching the color attachment
+         * loop in the render-pass path. */
+        attachment_state = GPU_ATTACHMENT_IGNORE;
+      }
     }
     attachment_info.imageView = vk_image_view;
     attachment_info.imageLayout = supports_local_read ? VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR :
                                                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    set_load_store(attachment_info, load_stores[color_attachment_index]);
+    if (attachment_state == GPU_ATTACHMENT_IGNORE) {
+      /* There is no view to load from or store to, and Vulkan requires DONT_CARE operations for
+       * an attachment with a null view. */
+      attachment_info.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+      attachment_info.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    }
+    else {
+      set_load_store(attachment_info, load_stores[color_attachment_index]);
+    }
 
     /* A read-only attachment takes the `GPU_ATTACHMENT_READ` path above, which creates no view, so
      * the image has to be checked here rather than only in the write branch. Registering a null
@@ -989,6 +1003,13 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
       if (image_view.is_valid()) {
         depth_image_view = image_view.vk_handle();
       }
+      else {
+        /* The view is created against the image of `depth_texture`, so it fails for the same
+         * textures, and it can also fail on its own parameters. A write state cannot be combined
+         * with a null view, so the attachment is treated as unused. The image itself is still
+         * valid and stays registered below. */
+        attachment_state = GPU_ATTACHMENT_IGNORE;
+      }
     }
     /* The attachment info is filled in below whether or not a view was created, so a null view has
      * to be reported through an undefined format. Gating this on the
@@ -1007,7 +1028,15 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
       attachment_info.imageView = depth_image_view;
       attachment_info.imageLayout = vk_image_layout;
 
-      set_load_store(attachment_info, load_stores[depth_attachment_index]);
+      if (attachment_state == GPU_ATTACHMENT_IGNORE) {
+        /* There is no view to load from or store to, and Vulkan requires DONT_CARE operations
+         * for an attachment with a null view. */
+        attachment_info.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachment_info.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      }
+      else {
+        set_load_store(attachment_info, load_stores[depth_attachment_index]);
+      }
       depth_attachment_format_ = vk_format;
       begin_rendering.node_data.vk_rendering_info.pDepthAttachment =
           &begin_rendering.node_data.depth_attachment;
@@ -1019,7 +1048,13 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
       attachment_info.imageView = depth_image_view;
       attachment_info.imageLayout = vk_image_layout;
 
-      set_load_store(attachment_info, load_stores[depth_attachment_index]);
+      if (attachment_state == GPU_ATTACHMENT_IGNORE) {
+        attachment_info.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachment_info.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      }
+      else {
+        set_load_store(attachment_info, load_stores[depth_attachment_index]);
+      }
       stencil_attachment_format_ = vk_format;
       begin_rendering.node_data.vk_rendering_info.pStencilAttachment =
           &begin_rendering.node_data.stencil_attachment;
@@ -1063,7 +1098,7 @@ void VKFrameBuffer::rendering_ensure(VKContext &context)
     rendering_ensure_render_pass(context);
   }
   else {
-    rendering_ensure_dynamic_rendering(context, workarounds);
+    rendering_ensure_dynamic_rendering(context);
   }
   dirty_attachments_ = false;
   dirty_state_ = false;

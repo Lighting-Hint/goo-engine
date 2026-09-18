@@ -446,12 +446,12 @@ VkBufferView VKDevice::dummy_texel_buffer_view_get(eGPUSamplerFormat sampler_for
   }
   /* Both calls are made outside the lock, because `ensure_updated()` allocates the buffer and may
    * submit a copy through the render graph, which must not happen while holding
-   * `dummy_resources_mutex_`. The buffer itself is device cached, and `ensure_buffer_view()` is
-   * `call_once` guarded, so neither call needs the placeholder cache mutex. */
+   * `dummy_resources_mutex_`. The buffer itself is device cached, and `ensure_and_get_buffer_view()`
+   * serializes the view creation and read-back with `release_data()` on its own mutex, so neither
+   * call needs the placeholder cache mutex. */
   VKVertexBuffer *vk_vertex_buffer = unwrap(vertex_buffer);
   vk_vertex_buffer->ensure_updated();
-  vk_vertex_buffer->ensure_buffer_view();
-  return vk_vertex_buffer->vk_buffer_view_get();
+  return vk_vertex_buffer->ensure_and_get_buffer_view();
 }
 
 VkBuffer VKDevice::dummy_buffer_get(VkDescriptorType vk_descriptor_type) const

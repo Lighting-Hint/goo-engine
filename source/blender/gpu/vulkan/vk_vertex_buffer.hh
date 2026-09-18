@@ -28,7 +28,7 @@ class VKVertexBuffer : public VertBuf {
    * A plain mutex rather than a `std::once_flag`: `release_data()` discards the view, so the
    * creation is not a once-only operation, it is a "create it while the handle is null"
    * operation. A `once_flag` would stay set after the view is discarded and the next
-   * `ensure_buffer_view()` would then return with `vk_buffer_view_get()` still asserting.
+   * `ensure_and_get_buffer_view()` would then return with a null view.
    * The check inside the lock makes that reuse safe.
    */
   mutable std::mutex vk_buffer_view_mutex_;
@@ -52,19 +52,16 @@ class VKVertexBuffer : public VertBuf {
     return buffer_.vk_handle();
   }
 
-  VkBufferView vk_buffer_view_get() const
-  {
-    /* Synchronized with `ensure_buffer_view()` and `release_data()`, so a caller cannot read a
-     * view that another thread is in the middle of discarding. */
-    std::scoped_lock lock(vk_buffer_view_mutex_);
-    BLI_assert(vk_buffer_view_ != VK_NULL_HANDLE);
-    return vk_buffer_view_;
-  }
+  /**
+   * Ensures the texel buffer view exists and returns it. Creation and read-back happen under a
+   * single lock scope: with separate calls, `release_data()` could acquire the mutex in between
+   * and the caller would be handed a null view.
+   */
+  VkBufferView ensure_and_get_buffer_view();
 
   void device_format_ensure();
   const GPUVertFormat &device_format_get() const;
   void ensure_updated();
-  void ensure_buffer_view();
 
  protected:
   void acquire_data() override;
