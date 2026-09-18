@@ -615,6 +615,17 @@ void VKFrameBuffer::rendering_ensure_render_pass(VKContext &context)
     BLI_assert_msg(color_texture.usage_get() & GPU_TEXTURE_USAGE_ATTACHMENT,
                    "Texture is used as an attachment, but doesn't have the "
                    "GPU_TEXTURE_USAGE_ATTACHMENT flag.");
+    /* An attachment texture can outlive the image it points at. `VKTexture` handles for texture
+     * views forward to their source texture, and the draw manager keeps views alive across
+     * `TextureFromPool::release()`, which frees the source texture and clears its `vk_image_`.
+     * Registering such a handle would make `VKResourceStateTracker::get_image` look up an image
+     * that was never added, and the lookup after it would read out of bounds.
+     *
+     * Treat the attachment as unused in that case, which is what the description below already
+     * does for attachments that are not written to. */
+    if (color_texture.vk_image_handle() == VK_NULL_HANDLE) {
+      continue;
+    }
     GPUAttachmentState attachment_state = attachment_states_[color_attachment_index];
     uint32_t layer_base = max_ii(attachment.layer, 0);
     int layer_count = color_texture.layer_count();
@@ -909,6 +920,10 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
     BLI_assert_msg(depth_texture.usage_get() & GPU_TEXTURE_USAGE_ATTACHMENT,
                    "Texture is used as an attachment, but doesn't have the "
                    "GPU_TEXTURE_USAGE_ATTACHMENT flag.");
+    /* See the color attachment loop above for why an attachment without an image is skipped. */
+    if (depth_texture.vk_image_handle() == VK_NULL_HANDLE) {
+      continue;
+    }
     bool is_depth_stencil_attachment = to_vk_image_aspect_flag_bits(
                                            depth_texture.device_format_get()) &
                                        VK_IMAGE_ASPECT_STENCIL_BIT;

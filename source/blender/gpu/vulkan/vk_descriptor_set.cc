@@ -206,6 +206,12 @@ void VKDescriptorSetTracker::bind_image_resource(const VKStateManager &state_man
     return;
   }
   VKTexture &texture = *texture_ptr;
+  const VkImage vk_image = texture.vk_image_handle();
+  /* See `bind_texture_resource` for why a texture without an image is skipped rather than
+   * registered. */
+  if (vk_image == VK_NULL_HANDLE) {
+    return;
+  }
   bind_image(
       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
       VK_NULL_HANDLE,
@@ -220,7 +226,7 @@ void VKDescriptorSetTracker::bind_image_resource(const VKStateManager &state_man
     layer_base = layer_range.start();
     layer_count = layer_range.size();
   }
-  access_info.images.append({texture.vk_image_handle(),
+  access_info.images.append({vk_image,
                              resource_binding.access_mask,
                              to_vk_image_aspect_flag_bits(texture.device_format_get()),
                              layer_base,
@@ -255,6 +261,20 @@ void VKDescriptorSetTracker::bind_texture_resource(const VKDevice &device,
         access_info.buffers.append({vertex_buffer->vk_handle(), resource_binding.access_mask});
       }
       else {
+        const VkImage vk_image = texture->vk_image_handle();
+        /* A bound texture can reference an image that no longer exists. `VKTexture` handles for
+         * texture views forward to their source texture, and the draw manager keeps views alive
+         * across `TextureFromPool::release()`, which frees the source texture and clears its
+         * `vk_image_`. The view is then still bound while its source has no image left.
+         *
+         * Registering such a handle would make `VKResourceStateTracker::get_image` look up an
+         * image that was never added, and the lookup after it would read out of bounds.
+         * `BLI_assert` cannot catch this either, since it is compiled out in release builds.
+         * Skip the binding instead: the descriptor stays undefined, which matches how this
+         * function already treats a resource that was not bound on the drawing path. */
+        if (vk_image == VK_NULL_HANDLE) {
+          break;
+        }
         const VKSampler &sampler = device.samplers().get(elem.sampler);
         bind_image(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                    sampler.vk_handle(),
@@ -262,7 +282,7 @@ void VKDescriptorSetTracker::bind_texture_resource(const VKDevice &device,
                        .vk_handle(),
                    VK_IMAGE_LAYOUT_GENERAL,
                    resource_binding.location);
-        access_info.images.append({texture->vk_image_handle(),
+        access_info.images.append({vk_image,
                                    resource_binding.access_mask,
                                    to_vk_image_aspect_flag_bits(texture->device_format_get()),
                                    0,
@@ -306,6 +326,14 @@ void VKDescriptorSetTracker::bind_texture_resource(const VKDevice &device,
        * no single cast reaches `VKTexture`. The first unwrap turns the opaque handle into a
        * `Texture *`, the second reaches the backend type. */
       VKTexture *filler_texture = unwrap(unwrap(dummy_texture));
+      const VkImage filler_image = filler_texture->vk_image_handle();
+      /* Same reasoning as the bound-texture case above: a placeholder without an image would
+       * register a handle that the render graph cannot resolve. The buffer-texture placeholders
+       * are the ones that may legitimately have no image of their own, but those take the
+       * `is_buffer_sampler` branch and never reach here. */
+      if (filler_image == VK_NULL_HANDLE) {
+        break;
+      }
       const VKSampler &sampler = device.samplers().get(
           ELEM(image_type,
                shader::ImageType::SHADOW_2D,
@@ -320,7 +348,7 @@ void VKDescriptorSetTracker::bind_texture_resource(const VKDevice &device,
                      .vk_handle(),
                  VK_IMAGE_LAYOUT_GENERAL,
                  resource_binding.location);
-      access_info.images.append({filler_texture->vk_image_handle(),
+      access_info.images.append({filler_image,
                                  resource_binding.access_mask,
                                  to_vk_image_aspect_flag_bits(filler_texture->device_format_get()),
                                  0,
@@ -343,13 +371,19 @@ void VKDescriptorSetTracker::bind_input_attachment_resource(
       /* See `bind_image_resource` for why the binding is skipped. */
       return;
     }
+    const VkImage vk_image = texture->vk_image_handle();
+    /* See `bind_texture_resource` for why a texture without an image is skipped rather than
+     * registered. */
+    if (vk_image == VK_NULL_HANDLE) {
+      return;
+    }
     bind_image(VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
                VK_NULL_HANDLE,
                texture->image_view_get(resource_binding.arrayed, VKImageViewFlags::NO_SWIZZLING)
                    .vk_handle(),
                VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR,
                resource_binding.location);
-    access_info.images.append({texture->vk_image_handle(),
+    access_info.images.append({vk_image,
                                resource_binding.access_mask,
                                to_vk_image_aspect_flag_bits(texture->device_format_get()),
                                0,
@@ -364,6 +398,12 @@ void VKDescriptorSetTracker::bind_input_attachment_resource(
       return;
     }
     VKTexture *texture = static_cast<VKTexture *>(elem.resource);
+    const VkImage vk_image = texture->vk_image_handle();
+    /* See `bind_texture_resource` for why a texture without an image is skipped rather than
+     * registered. */
+    if (vk_image == VK_NULL_HANDLE) {
+      return;
+    }
     if (supports_dynamic_rendering) {
       const VKSampler &sampler = device.samplers().get(elem.sampler);
       bind_image(
@@ -372,7 +412,7 @@ void VKDescriptorSetTracker::bind_input_attachment_resource(
           texture->image_view_get(resource_binding.arrayed, VKImageViewFlags::DEFAULT).vk_handle(),
           VK_IMAGE_LAYOUT_GENERAL,
           resource_binding.location);
-      access_info.images.append({texture->vk_image_handle(),
+      access_info.images.append({vk_image,
                                  resource_binding.access_mask,
                                  to_vk_image_aspect_flag_bits(texture->device_format_get()),
                                  0,
@@ -386,7 +426,7 @@ void VKDescriptorSetTracker::bind_input_attachment_resource(
                      .vk_handle(),
                  VK_IMAGE_LAYOUT_GENERAL,
                  resource_binding.location);
-      access_info.images.append({texture->vk_image_handle(),
+      access_info.images.append({vk_image,
                                  resource_binding.access_mask,
                                  to_vk_image_aspect_flag_bits(texture->device_format_get()),
                                  0,

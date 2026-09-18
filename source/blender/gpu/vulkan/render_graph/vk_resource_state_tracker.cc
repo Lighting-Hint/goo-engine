@@ -147,7 +147,19 @@ ResourceWithStamp VKResourceStateTracker::get_buffer(VkBuffer vk_buffer) const
 
 ResourceWithStamp VKResourceStateTracker::get_image(VkImage vk_image) const
 {
-  ResourceHandle handle = image_resources_.lookup(vk_image);
+  const ResourceHandle *found = image_resources_.lookup_ptr(vk_image);
+  if (found == nullptr) {
+    /* An image that was never registered cannot be tracked, and the handle lookup below would
+     * read past the end of `resources_`. Registering a null handle is the way this happens in
+     * practice: it reaches here through the descriptor sets, which skip such handles now, but a
+     * future caller could still produce one.
+     *
+     * Return a neutral stamp rather than asserting. The render graph then schedules the node
+     * without a dependency on the missing image, which is what a resource the graph does not
+     * know about can be given without inventing state for it. */
+    return {ResourceHandle(0), 0};
+  }
+  ResourceHandle handle = *found;
   const Resource &resource = resources_.lookup(handle);
   return get_stamp(handle, resource);
 }
