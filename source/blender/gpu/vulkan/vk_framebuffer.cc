@@ -663,7 +663,8 @@ void VKFrameBuffer::rendering_ensure_render_pass(VKContext &context)
     depth_attachment_reference.attachment = attachment_reference + 1;
 
     VkAttachmentDescription vk_attachment_description = {};
-    vk_attachment_description.format = is_unused ? VK_FORMAT_UNDEFINED : image_view.vk_format();
+vk_attachment_description.format = image_view.is_valid() ? image_view.vk_format() :
+                                                      to_vk_format(color_texture.device_format_get());
     vk_attachment_description.samples = VK_SAMPLE_COUNT_1_BIT;
     vk_attachment_description.initialLayout = vk_image_layout;
     vk_attachment_description.finalLayout = vk_image_layout;
