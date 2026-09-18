@@ -126,23 +126,42 @@ ResourceWithStamp VKResourceStateTracker::get_and_increase_stamp(ResourceHandle 
 
 ResourceWithStamp VKResourceStateTracker::get_image_and_increase_stamp(VkImage vk_image)
 {
-  ResourceHandle handle = image_resources_.lookup(vk_image);
-  Resource &resource = resources_.lookup(handle);
-  return get_and_increase_stamp(handle, resource);
+  const ResourceHandle *found = image_resources_.lookup_ptr(vk_image);
+  if (found == nullptr) {
+    return {NO_RESOURCE_HANDLE, 0};
+  }
+  Resource *resource = resources_.lookup_ptr(*found);
+  if (resource == nullptr) {
+    return {NO_RESOURCE_HANDLE, 0};
+  }
+  return get_and_increase_stamp(*found, *resource);
 }
 
 ResourceWithStamp VKResourceStateTracker::get_buffer_and_increase_stamp(VkBuffer vk_buffer)
 {
-  ResourceHandle handle = buffer_resources_.lookup(vk_buffer);
-  Resource &resource = resources_.lookup(handle);
-  return get_and_increase_stamp(handle, resource);
+  const ResourceHandle *found = buffer_resources_.lookup_ptr(vk_buffer);
+  if (found == nullptr) {
+    return {NO_RESOURCE_HANDLE, 0};
+  }
+  Resource *resource = resources_.lookup_ptr(*found);
+  if (resource == nullptr) {
+    return {NO_RESOURCE_HANDLE, 0};
+  }
+  return get_and_increase_stamp(*found, *resource);
 }
 
 ResourceWithStamp VKResourceStateTracker::get_buffer(VkBuffer vk_buffer) const
 {
-  ResourceHandle handle = buffer_resources_.lookup(vk_buffer);
-  const Resource &resource = resources_.lookup(handle);
-  return get_stamp(handle, resource);
+  const ResourceHandle *found = buffer_resources_.lookup_ptr(vk_buffer);
+  if (found == nullptr) {
+    return {NO_RESOURCE_HANDLE, 0};
+  }
+  const ResourceHandle handle = *found;
+  const Resource *resource = resources_.lookup_ptr(handle);
+  if (resource == nullptr) {
+    return {NO_RESOURCE_HANDLE, 0};
+  }
+  return get_stamp(handle, *resource);
 }
 
 ResourceWithStamp VKResourceStateTracker::get_image(VkImage vk_image) const
@@ -154,10 +173,9 @@ ResourceWithStamp VKResourceStateTracker::get_image(VkImage vk_image) const
      * practice: it reaches here through the descriptor sets, which skip such handles now, but a
      * future caller could still produce one.
      *
-     * Return a neutral stamp rather than asserting. The render graph then schedules the node
-     * without a dependency on the missing image, which is what a resource the graph does not
-     * know about can be given without inventing state for it. */
-    return {ResourceHandle(0), 0};
+     * Report the resource as untracked rather than as handle 0, which `create_resource_slot()`
+     * hands out to the first resource and therefore names a real resource. */
+    return {NO_RESOURCE_HANDLE, 0};
   }
   ResourceHandle handle = *found;
   const Resource &resource = resources_.lookup(handle);

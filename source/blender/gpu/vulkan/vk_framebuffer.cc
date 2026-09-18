@@ -615,18 +615,20 @@ void VKFrameBuffer::rendering_ensure_render_pass(VKContext &context)
     BLI_assert_msg(color_texture.usage_get() & GPU_TEXTURE_USAGE_ATTACHMENT,
                    "Texture is used as an attachment, but doesn't have the "
                    "GPU_TEXTURE_USAGE_ATTACHMENT flag.");
-    /* An attachment texture can outlive the image it points at. `VKTexture` handles for texture
-     * views forward to their source texture, and the draw manager keeps views alive across
+    /* A color attachment can be unusable because its image is gone: `VKTexture` handles for
+     * texture views forward to their source texture, and the draw manager keeps views alive across
      * `TextureFromPool::release()`, which frees the source texture and clears its `vk_image_`.
      * Registering such a handle would make `VKResourceStateTracker::get_image` look up an image
-     * that was never added, and the lookup after it would read out of bounds.
+     * that was never added, and it also cannot be used to build a view.
      *
-     * Treat the attachment as unused in that case, which is what the description below already
-     * does for attachments that are not written to. */
-    if (color_texture.vk_image_handle() == VK_NULL_HANDLE) {
-      continue;
-    }
-    GPUAttachmentState attachment_state = attachment_states_[color_attachment_index];
+     * The slot is kept and marked unused instead of being skipped. The attachment references below
+     * are derived from the slot index, so dropping a description would shift every later reference
+     * and produce an invalid render pass. `GPU_ATTACHMENT_IGNORE` already means "this slot holds
+     * no attachment" and appends `VK_ATTACHMENT_UNUSED` for exactly that reason. */
+    const bool has_image = color_texture.vk_image_handle() != VK_NULL_HANDLE;
+    GPUAttachmentState attachment_state = has_image ?
+                                              attachment_states_[color_attachment_index] :
+                                              GPU_ATTACHMENT_IGNORE;
     uint32_t layer_base = max_ii(attachment.layer, 0);
     int layer_count = color_texture.layer_count();
     if (attachment.layer == -1 && layer_count != 1) {
@@ -643,13 +645,14 @@ void VKFrameBuffer::rendering_ensure_render_pass(VKContext &context)
         srgb_ && enabled_srgb_,
         VKImageViewArrayed::DONT_CARE};
     const VKImageView &image_view = color_texture.image_view_get(image_view_info);
-    /* The view is created against the image of `color_texture`. It fails for a texture whose
-     * image is gone, which the check above already rejects, but also for a view whose parameters
-     * the device does not accept. Skip the attachment in either case: a null view reaches the
-     * driver through the attachment description and crashes it. */
+    /* The view is created against the image of `color_texture`, so it fails for the same textures,
+     * and it can also fail on its own parameters. A null view cannot be described either, so the
+     * slot is marked unused, matching the closing `VK_ATTACHMENT_UNUSED` reference that
+     * `GPU_ATTACHMENT_IGNORE` produces below. */
     if (!image_view.is_valid()) {
-      continue;
+      attachment_state = GPU_ATTACHMENT_IGNORE;
     }
+    const bool is_unused = attachment_state == GPU_ATTACHMENT_IGNORE;
     // TODO: Use VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL for readonly attachments.
     VkImageLayout vk_image_layout = (attachment_state == GPU_ATTACHMENT_READ) ?
                                         VK_IMAGE_LAYOUT_GENERAL :
@@ -660,12 +663,14 @@ void VKFrameBuffer::rendering_ensure_render_pass(VKContext &context)
     depth_attachment_reference.attachment = attachment_reference + 1;
 
     VkAttachmentDescription vk_attachment_description = {};
-    vk_attachment_description.format = image_view.vk_format();
+    vk_attachment_description.format = is_unused ? VK_FORMAT_UNDEFINED : image_view.vk_format();
     vk_attachment_description.samples = VK_SAMPLE_COUNT_1_BIT;
     vk_attachment_description.initialLayout = vk_image_layout;
     vk_attachment_description.finalLayout = vk_image_layout;
     vk_attachment_descriptions.append(std::move(vk_attachment_description));
-    vk_image_views.append(image_view.vk_handle());
+    /* The framebuffer needs a view for every attachment, and an unused attachment has none. The
+     * slot is still appended so the indices keep matching the descriptions and references. */
+    vk_image_views.append(is_unused ? VK_NULL_HANDLE : image_view.vk_handle());
 
     switch (attachment_state) {
       case GPU_ATTACHMENT_WRITE: {
@@ -869,6 +874,12 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
     BLI_assert_msg(color_texture.usage_get() & GPU_TEXTURE_USAGE_ATTACHMENT,
                    "Texture is used as an attachment, but doesn't have the "
                    "GPU_TEXTURE_USAGE_ATTACHMENT flag.");
+    /* See the color attachment loop in the render-pass path for why an attachment whose image is
+     * gone is treated as unused. Here the slot is already implicit in the running
+     * `colorAttachmentCount`, so marking it unused keeps the colour attachment indices in step
+     * with what the shaders expect. */
+    const VkImage color_image = color_texture.vk_image_handle();
+    const bool has_image = color_image != VK_NULL_HANDLE;
     /* To support `gpu_Layer` we need to set the layerCount to the number of layers it can
      * access.
      */
@@ -885,7 +896,9 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
 
     VkImageView vk_image_view = VK_NULL_HANDLE;
     uint32_t layer_base = max_ii(attachment.layer, 0);
-    GPUAttachmentState attachment_state = attachment_states_[color_attachment_index];
+    GPUAttachmentState attachment_state = has_image ?
+                                              attachment_states_[color_attachment_index] :
+                                              GPU_ATTACHMENT_IGNORE;
     VkFormat vk_format = to_vk_format(color_texture.device_format_get());
     if (attachment_state == GPU_ATTACHMENT_WRITE) {
       VKImageViewInfo image_view_info = {
@@ -898,9 +911,6 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
           srgb_ && enabled_srgb_,
           VKImageViewArrayed::DONT_CARE};
       const VKImageView &image_view = color_texture.image_view_get(image_view_info);
-      /* A failed view leaves `vk_image_view` null, which the format below already turns into
-       * `VK_FORMAT_UNDEFINED` when unused attachments are worked around. Check it explicitly so
-       * that a null view is never handed to the driver as a valid attachment. */
       if (image_view.is_valid()) {
         vk_image_view = image_view.vk_handle();
         vk_format = image_view.vk_format();
@@ -911,15 +921,23 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
                                                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     set_load_store(attachment_info, load_stores[color_attachment_index]);
 
-    access_info.images.append(
-        {color_texture.vk_image_handle(),
-         VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-         VK_IMAGE_ASPECT_COLOR_BIT,
-         layer_base});
-    color_attachment_formats_.append(
-        (workarounds.dynamic_rendering_unused_attachments && vk_image_view == VK_NULL_HANDLE) ?
-            VK_FORMAT_UNDEFINED :
-            vk_format);
+    /* A read-only attachment takes the `GPU_ATTACHMENT_READ` path above, which creates no view, so
+     * the image has to be checked here rather than only in the write branch. Registering a null
+     * handle would make `VKResourceStateTracker::get_image` look up an image that was never
+     * added. */
+    if (!has_image || attachment_state == GPU_ATTACHMENT_IGNORE) {
+      /* No image to register. The format is left undefined so the attachment is reported as
+       * unused, which the colour blend lookup below relies on. */
+      color_attachment_formats_.append(VK_FORMAT_UNDEFINED);
+    }
+    else {
+      access_info.images.append({color_image,
+                                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                 VK_IMAGE_ASPECT_COLOR_BIT,
+                                 layer_base});
+      color_attachment_formats_.append(vk_format);
+    }
 
     begin_rendering.node_data.vk_rendering_info.pColorAttachments =
         begin_rendering.node_data.color_attachments;
@@ -937,7 +955,9 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
     BLI_assert_msg(depth_texture.usage_get() & GPU_TEXTURE_USAGE_ATTACHMENT,
                    "Texture is used as an attachment, but doesn't have the "
                    "GPU_TEXTURE_USAGE_ATTACHMENT flag.");
-    /* See the color attachment loop above for why an attachment without an image is skipped. */
+    /* See the color attachment loop above for why an attachment without an image is skipped. The
+     * depth and stencil slots are handled in a single pass and end in a `break`, so dropping the
+     * slot here does not shift any reference. */
     if (depth_texture.vk_image_handle() == VK_NULL_HANDLE) {
       continue;
     }
@@ -958,16 +978,15 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
                                          false,
                                          VKImageViewArrayed::DONT_CARE};
       const VKImageView &image_view = depth_texture.image_view_get(image_view_info);
-      /* Unlike the render-pass path above, an invalid view is not skipped here: the attachment
-       * info stays in the rendering info either way, so a missing view has to be reported through
-       * an undefined format instead. Leaving `depth_image_view` null does that, since the format
-       * below is then `VK_FORMAT_UNDEFINED` and the attachment is treated as unused. */
       if (image_view.is_valid()) {
         depth_image_view = image_view.vk_handle();
       }
     }
-    VkFormat vk_format = (workarounds.dynamic_rendering_unused_attachments &&
-                          depth_image_view == VK_NULL_HANDLE) ?
+    /* The attachment info is filled in below whether or not a view was created, so a null view has
+     * to be reported through an undefined format. Gating this on the
+     * `dynamic_rendering_unused_attachments` workaround would submit a null view together with a
+     * real format on the devices that do not need the workaround, which is invalid Vulkan usage. */
+    VkFormat vk_format = (depth_image_view == VK_NULL_HANDLE) ?
                              VK_FORMAT_UNDEFINED :
                              to_vk_format(depth_texture.device_format_get());
 
