@@ -643,6 +643,13 @@ void VKFrameBuffer::rendering_ensure_render_pass(VKContext &context)
         srgb_ && enabled_srgb_,
         VKImageViewArrayed::DONT_CARE};
     const VKImageView &image_view = color_texture.image_view_get(image_view_info);
+    /* The view is created against the image of `color_texture`. It fails for a texture whose
+     * image is gone, which the check above already rejects, but also for a view whose parameters
+     * the device does not accept. Skip the attachment in either case: a null view reaches the
+     * driver through the attachment description and crashes it. */
+    if (!image_view.is_valid()) {
+      continue;
+    }
     // TODO: Use VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL for readonly attachments.
     VkImageLayout vk_image_layout = (attachment_state == GPU_ATTACHMENT_READ) ?
                                         VK_IMAGE_LAYOUT_GENERAL :
@@ -723,7 +730,12 @@ void VKFrameBuffer::rendering_ensure_render_pass(VKContext &context)
                                          is_stencil_attachment,
                                          false,
                                          VKImageViewArrayed::DONT_CARE};
-      depth_image_view = depth_texture.image_view_get(image_view_info).vk_handle();
+      const VKImageView &image_view = depth_texture.image_view_get(image_view_info);
+      /* See the color attachment loop above for why a failed view is skipped. */
+      if (!image_view.is_valid()) {
+        continue;
+      }
+      depth_image_view = image_view.vk_handle();
     }
     VkAttachmentDescription vk_attachment_description = {};
     vk_attachment_description.format = to_vk_format(depth_texture.device_format_get());
@@ -886,8 +898,13 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
           srgb_ && enabled_srgb_,
           VKImageViewArrayed::DONT_CARE};
       const VKImageView &image_view = color_texture.image_view_get(image_view_info);
-      vk_image_view = image_view.vk_handle();
-      vk_format = image_view.vk_format();
+      /* A failed view leaves `vk_image_view` null, which the format below already turns into
+       * `VK_FORMAT_UNDEFINED` when unused attachments are worked around. Check it explicitly so
+       * that a null view is never handed to the driver as a valid attachment. */
+      if (image_view.is_valid()) {
+        vk_image_view = image_view.vk_handle();
+        vk_format = image_view.vk_format();
+      }
     }
     attachment_info.imageView = vk_image_view;
     attachment_info.imageLayout = supports_local_read ? VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR :
@@ -940,7 +957,14 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
                                          is_stencil_attachment,
                                          false,
                                          VKImageViewArrayed::DONT_CARE};
-      depth_image_view = depth_texture.image_view_get(image_view_info).vk_handle();
+      const VKImageView &image_view = depth_texture.image_view_get(image_view_info);
+      /* Unlike the render-pass path above, an invalid view is not skipped here: the attachment
+       * info stays in the rendering info either way, so a missing view has to be reported through
+       * an undefined format instead. Leaving `depth_image_view` null does that, since the format
+       * below is then `VK_FORMAT_UNDEFINED` and the attachment is treated as unused. */
+      if (image_view.is_valid()) {
+        depth_image_view = image_view.vk_handle();
+      }
     }
     VkFormat vk_format = (workarounds.dynamic_rendering_unused_attachments &&
                           depth_image_view == VK_NULL_HANDLE) ?

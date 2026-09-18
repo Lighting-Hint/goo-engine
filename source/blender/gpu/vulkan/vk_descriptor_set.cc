@@ -207,17 +207,21 @@ void VKDescriptorSetTracker::bind_image_resource(const VKStateManager &state_man
   }
   VKTexture &texture = *texture_ptr;
   const VkImage vk_image = texture.vk_image_handle();
-  /* See `bind_texture_resource` for why a texture without an image is skipped rather than
-   * registered. */
+  /* See `bind_texture_resource` for why a texture without an image, or whose view failed to
+   * create, is skipped rather than registered. */
   if (vk_image == VK_NULL_HANDLE) {
     return;
   }
-  bind_image(
-      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-      VK_NULL_HANDLE,
-      texture.image_view_get(resource_binding.arrayed, VKImageViewFlags::NO_SWIZZLING).vk_handle(),
-      VK_IMAGE_LAYOUT_GENERAL,
-      resource_binding.location);
+  const VKImageView &image_view = texture.image_view_get(resource_binding.arrayed,
+                                                        VKImageViewFlags::NO_SWIZZLING);
+  if (!image_view.is_valid()) {
+    return;
+  }
+  bind_image(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+             VK_NULL_HANDLE,
+             image_view.vk_handle(),
+             VK_IMAGE_LAYOUT_GENERAL,
+             resource_binding.location);
   /* Update access info. */
   uint32_t layer_base = 0;
   uint32_t layer_count = VK_REMAINING_ARRAY_LAYERS;
@@ -275,11 +279,18 @@ void VKDescriptorSetTracker::bind_texture_resource(const VKDevice &device,
         if (vk_image == VK_NULL_HANDLE) {
           break;
         }
+        /* The image view is created against the image above, so it fails for the same textures.
+         * Handing an empty view to the descriptor set crashes the driver, which dereferences it
+         * while updating the descriptor. */
+        const VKImageView &image_view = texture->image_view_get(resource_binding.arrayed,
+                                                               VKImageViewFlags::DEFAULT);
+        if (!image_view.is_valid()) {
+          break;
+        }
         const VKSampler &sampler = device.samplers().get(elem.sampler);
         bind_image(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                    sampler.vk_handle(),
-                   texture->image_view_get(resource_binding.arrayed, VKImageViewFlags::DEFAULT)
-                       .vk_handle(),
+                   image_view.vk_handle(),
                    VK_IMAGE_LAYOUT_GENERAL,
                    resource_binding.location);
         access_info.images.append({vk_image,
@@ -342,10 +353,17 @@ void VKDescriptorSetTracker::bind_texture_resource(const VKDevice &device,
                shader::ImageType::SHADOW_CUBE_ARRAY) ?
               GPUSamplerState::compare_sampler() :
               GPUSamplerState::default_sampler());
+      /* The placeholder's view fails to create under the same condition as the image is missing,
+       * which the check above already covers. Check it anyway so every binding path treats a
+       * failed view the same way. */
+      const VKImageView &filler_view = filler_texture->image_view_get(resource_binding.arrayed,
+                                                                     VKImageViewFlags::DEFAULT);
+      if (!filler_view.is_valid()) {
+        break;
+      }
       bind_image(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                  sampler.vk_handle(),
-                 filler_texture->image_view_get(resource_binding.arrayed, VKImageViewFlags::DEFAULT)
-                     .vk_handle(),
+                 filler_view.vk_handle(),
                  VK_IMAGE_LAYOUT_GENERAL,
                  resource_binding.location);
       access_info.images.append({filler_image,
@@ -372,15 +390,19 @@ void VKDescriptorSetTracker::bind_input_attachment_resource(
       return;
     }
     const VkImage vk_image = texture->vk_image_handle();
-    /* See `bind_texture_resource` for why a texture without an image is skipped rather than
-     * registered. */
+    /* See `bind_texture_resource` for why a texture without an image, or whose view failed to
+     * create, is skipped rather than registered. */
     if (vk_image == VK_NULL_HANDLE) {
+      return;
+    }
+    const VKImageView &image_view = texture->image_view_get(resource_binding.arrayed,
+                                                          VKImageViewFlags::NO_SWIZZLING);
+    if (!image_view.is_valid()) {
       return;
     }
     bind_image(VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
                VK_NULL_HANDLE,
-               texture->image_view_get(resource_binding.arrayed, VKImageViewFlags::NO_SWIZZLING)
-                   .vk_handle(),
+               image_view.vk_handle(),
                VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR,
                resource_binding.location);
     access_info.images.append({vk_image,
@@ -399,19 +421,23 @@ void VKDescriptorSetTracker::bind_input_attachment_resource(
     }
     VKTexture *texture = static_cast<VKTexture *>(elem.resource);
     const VkImage vk_image = texture->vk_image_handle();
-    /* See `bind_texture_resource` for why a texture without an image is skipped rather than
-     * registered. */
+    /* See `bind_texture_resource` for why a texture without an image, or whose view failed to
+     * create, is skipped rather than registered. */
     if (vk_image == VK_NULL_HANDLE) {
       return;
     }
     if (supports_dynamic_rendering) {
+      const VKImageView &image_view = texture->image_view_get(resource_binding.arrayed,
+                                                            VKImageViewFlags::DEFAULT);
+      if (!image_view.is_valid()) {
+        return;
+      }
       const VKSampler &sampler = device.samplers().get(elem.sampler);
-      bind_image(
-          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-          sampler.vk_handle(),
-          texture->image_view_get(resource_binding.arrayed, VKImageViewFlags::DEFAULT).vk_handle(),
-          VK_IMAGE_LAYOUT_GENERAL,
-          resource_binding.location);
+      bind_image(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                 sampler.vk_handle(),
+                 image_view.vk_handle(),
+                 VK_IMAGE_LAYOUT_GENERAL,
+                 resource_binding.location);
       access_info.images.append({vk_image,
                                  resource_binding.access_mask,
                                  to_vk_image_aspect_flag_bits(texture->device_format_get()),
@@ -420,10 +446,14 @@ void VKDescriptorSetTracker::bind_input_attachment_resource(
     }
     else {
       /* Fallback to render-passes / sub-passes. */
+      const VKImageView &image_view = texture->image_view_get(resource_binding.arrayed,
+                                                            VKImageViewFlags::NO_SWIZZLING);
+      if (!image_view.is_valid()) {
+        return;
+      }
       bind_image(VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
                  VK_NULL_HANDLE,
-                 texture->image_view_get(resource_binding.arrayed, VKImageViewFlags::NO_SWIZZLING)
-                     .vk_handle(),
+                 image_view.vk_handle(),
                  VK_IMAGE_LAYOUT_GENERAL,
                  resource_binding.location);
       access_info.images.append({vk_image,
