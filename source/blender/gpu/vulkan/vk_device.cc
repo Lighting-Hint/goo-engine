@@ -6,6 +6,7 @@
  * \ingroup gpu
  */
 
+#include <array>
 #include <sstream>
 
 #include "vk_backend.hh"
@@ -252,14 +253,47 @@ void VKDevice::init_dummy_buffer()
   dummy_buffer.update_immediately(static_cast<void *>(data));
 }
 
+/**
+ * Maps a texture type to a dense cache slot.
+ *
+ * `eGPUTextureType` is a bit mask, so its values (`1, 2, 4, 8, 16, 17, 18, 24, 32`) are sparse and
+ * using the raw value as an array index would silently assume that every value stays below the
+ * highest bit. This table makes the mapping explicit, so the cache size follows from the number of
+ * types that actually reach here rather than from an arithmetic bound on the enum.
+ *
+ * `GPU_TEXTURE_ARRAY` and `GPU_TEXTURE_BUFFER` are absent because `to_dummy_texture_type()` never
+ * produces them: arrayed declarations map to the combined `*_ARRAY` values, and buffer declarations
+ * are routed to the texel buffer path before reaching this function.
+ */
+static constexpr std::array<eGPUTextureType, 7> DUMMY_TEXTURE_TYPES = {
+    GPU_TEXTURE_1D,
+    GPU_TEXTURE_1D_ARRAY,
+    GPU_TEXTURE_2D,
+    GPU_TEXTURE_2D_ARRAY,
+    GPU_TEXTURE_3D,
+    GPU_TEXTURE_CUBE,
+    GPU_TEXTURE_CUBE_ARRAY,
+};
+
+static_assert(DUMMY_TEXTURE_TYPES.size() == VKDevice::DUMMY_TEXTURE_TYPE_COUNT,
+              "dummy texture cache dimensions are out of sync");
+
+static size_t to_dummy_texture_index(const eGPUTextureType type)
+{
+  for (size_t i = 0; i < DUMMY_TEXTURE_TYPES.size(); i++) {
+    if (DUMMY_TEXTURE_TYPES[i] == type) {
+      return i;
+    }
+  }
+  BLI_assert_msg(false, "Unrecognised texture type for dummy texture cache");
+  return 0;
+}
+
 GPUTexture *VKDevice::dummy_texture_get(eGPUTextureType type,
                                         eGPUSamplerFormat sampler_format) const
 {
-  /* `eGPUTextureType` is a bit mask, so the cache is indexed by the raw value. Every combination
-   * used as a sampler type stays below `GPU_TEXTURE_BUFFER + 1`. */
-  static_assert(GPU_TEXTURE_CUBE_ARRAY < GPU_TEXTURE_BUFFER + 1,
-                "dummy texture cache is too small for the texture type values");
-  const size_t cache_index = size_t(sampler_format) * size_t(GPU_TEXTURE_BUFFER + 1) + size_t(type);
+  const size_t cache_index = size_t(sampler_format) * DUMMY_TEXTURE_TYPES.size() +
+                             to_dummy_texture_index(type);
   GPUTexture *dummy_tex = dummy_textures_[cache_index];
   if (dummy_tex != nullptr) {
     return dummy_tex;

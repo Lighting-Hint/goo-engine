@@ -228,6 +228,15 @@ class VKDevice : public NonCopyable {
   VKPipelinePool pipelines;
   /** Buffer to bind to unbound resource locations. */
   VKBuffer dummy_buffer;
+
+  /**
+   * Number of distinct texture types the dummy texture cache distinguishes. `eGPUTextureType` is a
+   * bit mask whose values are sparse, so the cache is indexed by a dense slot derived from this
+   * count rather than by the raw enum value. Kept in sync with `DUMMY_TEXTURE_TYPES` in
+   * `vk_device.cc` by a `static_assert`.
+   */
+  static constexpr size_t DUMMY_TEXTURE_TYPE_COUNT = 7;
+
   /**
    * Texture to bind to unbound sampler locations, created on first request and cached per type
    * and sampler format.
@@ -483,9 +492,12 @@ class VKDevice : public NonCopyable {
    * texture type, mirroring `MTLContext::dummy_textures_`. `mutable` because the cache is filled
    * on first use, which happens through the `const VKDevice &` handed to the drawing paths; it
    * does not change the observable state of the device.
+   *
+   * `eGPUTextureType` is a bit mask, so the second dimension is not indexed by the raw enum value
+   * but by the dense slot assigned in `vk_device.cc`; see `DUMMY_TEXTURE_TYPES`. The count has to
+   * stay in sync with that table, which a `static_assert` in the implementation enforces.
    */
-  mutable std::array<GPUTexture *,
-                     size_t(GPU_SAMPLER_TYPE_MAX) * size_t(GPU_TEXTURE_BUFFER + 1)>
+  mutable std::array<GPUTexture *, size_t(GPU_SAMPLER_TYPE_MAX) * DUMMY_TEXTURE_TYPE_COUNT>
       dummy_textures_ = {};
 
   /**
