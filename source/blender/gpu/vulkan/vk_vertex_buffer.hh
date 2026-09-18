@@ -24,8 +24,14 @@ class VKVertexBuffer : public VertBuf {
   /**
    * Guards the lazy creation of `vk_buffer_view_`, which a drawing path can reach from several
    * threads at once. Without it two threads would each create a view and leak one of them.
+   *
+   * A plain mutex rather than a `std::once_flag`: `release_data()` discards the view, so the
+   * creation is not a once-only operation, it is a "create it while the handle is null"
+   * operation. A `once_flag` would stay set after the view is discarded and the next
+   * `ensure_buffer_view()` would then return with `vk_buffer_view_get()` still asserting.
+   * The check inside the lock makes that reuse safe.
    */
-  std::once_flag vk_buffer_view_once_;
+  mutable std::mutex vk_buffer_view_mutex_;
 
   VertexFormatConverter vertex_format_converter;
   bool data_uploaded_ = false;
@@ -48,6 +54,9 @@ class VKVertexBuffer : public VertBuf {
 
   VkBufferView vk_buffer_view_get() const
   {
+    /* Synchronized with `ensure_buffer_view()` and `release_data()`, so a caller cannot read a
+     * view that another thread is in the middle of discarding. */
+    std::scoped_lock lock(vk_buffer_view_mutex_);
     BLI_assert(vk_buffer_view_ != VK_NULL_HANDLE);
     return vk_buffer_view_;
   }

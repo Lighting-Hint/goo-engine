@@ -43,22 +43,26 @@ void VKVertexBuffer::ensure_updated()
 
 void VKVertexBuffer::ensure_buffer_view()
 {
-  /* Callers can reach this from several threads at once, so the creation has to happen exactly
-   * once. `vk_buffer_view_get()` is only ever called after this returns, so the flag also acts as
-   * the publication point for `vk_buffer_view_`. */
-  std::call_once(vk_buffer_view_once_, [this]() {
-    VkBufferViewCreateInfo buffer_view_info = {};
-    eGPUTextureFormat texture_format = to_texture_format(&format);
+  /* Callers can reach this from several threads at once, so the creation has to be serialized.
+   * The handle is re-checked under the lock because `release_data()` can have discarded an
+   * earlier view, which is also why this is not a `std::call_once`: a cleared vertex buffer
+   * reacquires its data, and then needs a view again. */
+  std::scoped_lock lock(vk_buffer_view_mutex_);
+  if (vk_buffer_view_ != VK_NULL_HANDLE) {
+    return;
+  }
 
-    buffer_view_info.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
-    buffer_view_info.buffer = buffer_.vk_handle();
-    buffer_view_info.format = to_vk_format(texture_format);
-    buffer_view_info.range = buffer_.size_in_bytes();
+  VkBufferViewCreateInfo buffer_view_info = {};
+  eGPUTextureFormat texture_format = to_texture_format(&format);
 
-    const VKDevice &device = VKBackend::get().device;
-    vkCreateBufferView(device.vk_handle(), &buffer_view_info, nullptr, &vk_buffer_view_);
-    debug::object_label(vk_buffer_view_, "VertexBufferView");
-  });
+  buffer_view_info.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
+  buffer_view_info.buffer = buffer_.vk_handle();
+  buffer_view_info.format = to_vk_format(texture_format);
+  buffer_view_info.range = buffer_.size_in_bytes();
+
+  const VKDevice &device = VKBackend::get().device;
+  vkCreateBufferView(device.vk_handle(), &buffer_view_info, nullptr, &vk_buffer_view_);
+  debug::object_label(vk_buffer_view_, "VertexBufferView");
 }
 
 void VKVertexBuffer::wrap_handle(uint64_t /*handle*/)
@@ -107,9 +111,15 @@ void VKVertexBuffer::resize_data()
 
 void VKVertexBuffer::release_data()
 {
-  if (vk_buffer_view_ != VK_NULL_HANDLE) {
-    VKDiscardPool::discard_pool_get().discard_buffer_view(vk_buffer_view_);
-    vk_buffer_view_ = VK_NULL_HANDLE;
+  /* Taking the lock here is what makes the discard safe against `ensure_buffer_view()` running on
+   * another thread: without it the view could be created after this discarded it, and the
+   * `vk_buffer_view_` just written would be leaked. */
+  {
+    std::scoped_lock lock(vk_buffer_view_mutex_);
+    if (vk_buffer_view_ != VK_NULL_HANDLE) {
+      VKDiscardPool::discard_pool_get().discard_buffer_view(vk_buffer_view_);
+      vk_buffer_view_ = VK_NULL_HANDLE;
+    }
   }
 
   MEM_SAFE_FREE(data_);
