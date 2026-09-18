@@ -907,7 +907,10 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context)
                                               attachment_states_[color_attachment_index] :
                                               GPU_ATTACHMENT_IGNORE;
     VkFormat vk_format = to_vk_format(color_texture.device_format_get());
-    if (attachment_state == GPU_ATTACHMENT_WRITE) {
+    /* A read-only attachment also needs a view: dynamic rendering submits the attachment info
+     * with real load/store ops for both `GPU_ATTACHMENT_WRITE` and `GPU_ATTACHMENT_READ`, and a
+     * null view is only valid together with DONT_CARE operations. */
+    if (attachment_state != GPU_ATTACHMENT_IGNORE) {
       VKImageViewInfo image_view_info = {
           eImageViewUsage::Attachment,
           IndexRange(layer_base,
@@ -924,9 +927,9 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context)
       }
       else {
         /* The view is created against the image of `color_texture`, so it fails for the same
-         * textures, and it can also fail on its own parameters. A write state cannot be combined
-         * with a null view, so the attachment is treated as unused, matching the color attachment
-         * loop in the render-pass path. */
+         * textures, and it can also fail on its own parameters. An attachment state cannot be
+         * combined with a null view, so the attachment is treated as unused, matching the color
+         * attachment loop in the render-pass path. */
         attachment_state = GPU_ATTACHMENT_IGNORE;
       }
     }
@@ -943,21 +946,23 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context)
       set_load_store(attachment_info, load_stores[color_attachment_index]);
     }
 
-    /* A read-only attachment takes the `GPU_ATTACHMENT_READ` path above, which creates no view, so
-     * the image has to be checked here rather than only in the write branch. Registering a null
-     * handle would make `VKResourceStateTracker::get_image` look up an image that was never
-     * added. */
-    if (!has_image || attachment_state == GPU_ATTACHMENT_IGNORE) {
+    /* An attachment whose image is gone is degraded to `GPU_ATTACHMENT_IGNORE` above, so the
+     * state check covers both cases. Registering a null handle would make
+     * `VKResourceStateTracker::get_image` look up an image that was never added. */
+    if (attachment_state == GPU_ATTACHMENT_IGNORE) {
       /* No image to register. The format is left undefined so the attachment is reported as
        * unused, which the colour blend lookup below relies on. */
       color_attachment_formats_.append(VK_FORMAT_UNDEFINED);
     }
     else {
-      access_info.images.append({color_image,
-                                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                                 VK_IMAGE_ASPECT_COLOR_BIT,
-                                 layer_base});
+      /* Register with the access the subpass actually performs, matching the render-pass path:
+       * a read-only attachment only reads, a write attachment reads and writes. */
+      const VkAccessFlags access_mask = (attachment_state == GPU_ATTACHMENT_READ) ?
+                                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT :
+                                            (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+      access_info.images.append(
+          {color_image, access_mask, VK_IMAGE_ASPECT_COLOR_BIT, layer_base});
       color_attachment_formats_.append(vk_format);
     }
 
@@ -991,7 +996,9 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context)
                                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     GPUAttachmentState attachment_state = attachment_states_[GPU_FB_DEPTH_ATTACHMENT];
     VkImageView depth_image_view = VK_NULL_HANDLE;
-    if (attachment_state == GPU_ATTACHMENT_WRITE) {
+    /* A read-only attachment also needs a view: the attachment info is submitted with real
+     * load/store ops, and a null view is only valid together with DONT_CARE operations. */
+    if (attachment_state != GPU_ATTACHMENT_IGNORE) {
       VKImageViewInfo image_view_info = {eImageViewUsage::Attachment,
                                          IndexRange(max_ii(attachment.layer, 0), 1),
                                          IndexRange(attachment.mip, 1),

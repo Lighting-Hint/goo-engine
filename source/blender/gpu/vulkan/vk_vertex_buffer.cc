@@ -38,6 +38,12 @@ void VKVertexBuffer::bind_as_texture(uint binding)
 
 void VKVertexBuffer::ensure_updated()
 {
+  /* The dummy resources are shared device-level vertex buffers, which can be reached from
+   * several threads at once. `upload_data()` mutates `buffer_`, `data_uploaded_` and the dirty
+   * flags without any synchronization of its own, so the upload has to be serialized per buffer
+   * here. This mutex is independent from the view mutex: `upload_data()` never touches the
+   * buffer view, and neither lock is taken while holding the other. */
+  std::scoped_lock lock(upload_mutex_);
   upload_data();
 }
 

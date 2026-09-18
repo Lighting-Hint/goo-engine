@@ -33,6 +33,14 @@ class VKVertexBuffer : public VertBuf {
    */
   mutable std::mutex vk_buffer_view_mutex_;
 
+  /**
+   * Serializes `ensure_updated()`. The device-level dummy vertex buffers are shared between
+   * threads, and `upload_data()` mutates the allocation state, `data_uploaded_` and the dirty
+   * flags without synchronization of its own. Kept separate from `vk_buffer_view_mutex_` because
+   * the upload path may submit through the render graph, while view creation must not.
+   */
+  mutable std::mutex upload_mutex_;
+
   VertexFormatConverter vertex_format_converter;
   bool data_uploaded_ = false;
 
