@@ -7,6 +7,7 @@
  */
 
 #include <array>
+#include <mutex>
 #include <sstream>
 
 #include "vk_backend.hh"
@@ -68,6 +69,9 @@ void VKDevice::deinit()
       dummy_vertex_buffer = nullptr;
     }
   }
+  /* All placeholder caches have been released above, so nothing can contend for the mutex. */
+  delete dummy_resources_mutex_;
+  dummy_resources_mutex_ = nullptr;
   samplers_.free();
 
   {
@@ -134,6 +138,9 @@ void VKDevice::init(void *ghost_context)
 
   samplers_.init();
   init_dummy_buffer();
+  /* Guards the placeholder caches below. Created eagerly because they are filled from the drawing
+   * paths, which several threads can reach concurrently. */
+  dummy_resources_mutex_ = new std::mutex();
   /* NOTE: The dummy texture is created lazily on first use. Creating a texture uploads its
    * initial pixels through the render graph, which needs a context that does not exist yet at
    * this point (`context_alloc()` constructs the first context only after `device.init()`
@@ -299,6 +306,15 @@ GPUTexture *VKDevice::dummy_texture_get(eGPUTextureType type,
     return dummy_tex;
   }
 
+  /* The cache is shared between threads, so creation is serialized. Lookups above stay lock free,
+   * which keeps the common case (an entry that already exists) off the critical section. */
+  std::scoped_lock lock(*dummy_resources_mutex_);
+  /* Another thread may have created the entry while this one was waiting for the lock. */
+  dummy_tex = dummy_textures_[cache_index];
+  if (dummy_tex != nullptr) {
+    return dummy_tex;
+  }
+
   /* The placeholder has to match the declared sampler type, otherwise its image view is
    * incompatible with the descriptor and `vkUpdateDescriptorSets` fails validation. The format
    * follows the sampler format so that a shader reading it never sees a type mismatch either. */
@@ -351,8 +367,9 @@ GPUTexture *VKDevice::dummy_texture_get(eGPUTextureType type,
       break;
     case GPU_TEXTURE_BUFFER: {
       /* A buffer texture wraps a vertex buffer rather than owning storage, so the vertex buffer
-       * has to outlive the texture and is cached on the device. */
-      VertBuf *vertex_buffer = dummy_buffer_texture_ensure(sampler_format);
+       * has to outlive the texture and is cached on the device. The unlocked variant is used
+       * because this function already holds `dummy_resources_mutex_`. */
+      VertBuf *vertex_buffer = dummy_buffer_texture_ensure_unlocked(sampler_format);
       if (vertex_buffer == nullptr) {
         return nullptr;
       }
@@ -368,8 +385,15 @@ GPUTexture *VKDevice::dummy_texture_get(eGPUTextureType type,
   return dummy_tex;
 }
 
-VertBuf *VKDevice::dummy_buffer_texture_ensure(eGPUSamplerFormat sampler_format) const
+VertBuf *VKDevice::dummy_buffer_texture_ensure_locked(eGPUSamplerFormat sampler_format) const
 {
+  std::scoped_lock lock(*dummy_resources_mutex_);
+  return dummy_buffer_texture_ensure_unlocked(sampler_format);
+}
+
+VertBuf *VKDevice::dummy_buffer_texture_ensure_unlocked(eGPUSamplerFormat sampler_format) const
+{
+  /* The caller owns `dummy_resources_mutex_`; see the declaration. */
   VertBuf *&vertex_buffer = dummy_buffer_textures_[size_t(sampler_format)];
   if (vertex_buffer != nullptr) {
     return vertex_buffer;
@@ -411,10 +435,14 @@ VertBuf *VKDevice::dummy_buffer_texture_ensure(eGPUSamplerFormat sampler_format)
 
 VkBufferView VKDevice::dummy_texel_buffer_view_get(eGPUSamplerFormat sampler_format) const
 {
-  VertBuf *vertex_buffer = dummy_buffer_texture_ensure(sampler_format);
+  VertBuf *vertex_buffer = dummy_buffer_texture_ensure_locked(sampler_format);
   if (vertex_buffer == nullptr) {
     return VK_NULL_HANDLE;
   }
+  /* Deliberately outside the lock: `ensure_updated()` and `ensure_buffer_view()` submit work
+   * through the render graph, which must not run while holding `dummy_resources_mutex_`. The
+   * vertex buffer is cached on the device and stays valid, so this is safe to do unlocked -- the
+   * worst case is two threads uploading the same buffer, which is idempotent. */
   VKVertexBuffer *vk_vertex_buffer = unwrap(vertex_buffer);
   vk_vertex_buffer->ensure_updated();
   vk_vertex_buffer->ensure_buffer_view();
@@ -439,6 +467,14 @@ VkBuffer VKDevice::dummy_buffer_get(VkDescriptorType vk_descriptor_type) const
       return VK_NULL_HANDLE;
   }
 
+  if (*cached != nullptr) {
+    return (*cached)->vk_handle();
+  }
+
+  /* Creation is serialized for the same reason as the texture cache; the lookup above stays lock
+   * free. `VKBuffer::create()` only issues `vkCreateBuffer`/`vkAllocateMemory`, so it is safe to
+   * run inside the critical section. */
+  std::scoped_lock lock(*dummy_resources_mutex_);
   if (*cached != nullptr) {
     return (*cached)->vk_handle();
   }

@@ -10,6 +10,7 @@
 
 #include <array>
 #include <atomic>
+#include <mutex>
 
 #include "BLI_task.h"
 #include "BLI_threads.h"
@@ -156,6 +157,24 @@ class VKDevice : public NonCopyable {
   uint32_t vk_queue_family_ = 0;
   VkQueue vk_queue_ = VK_NULL_HANDLE;
   std::mutex *queue_mutex_ = nullptr;
+
+  /**
+   * Guards the lazy placeholder caches (`dummy_textures_`, `dummy_buffer_textures_` and the two
+   * dummy buffers).
+   *
+   * Those caches live on the device but are filled from the drawing paths, which several threads
+   * can reach at the same time (each thread has its own `VKThreadData`, but the caches are shared).
+   * Without this, two threads could both miss the same entry and create it concurrently, leaking
+   * one of the two resources and racing on the pointer store.
+   *
+   * Deliberately separate from `VKResourceStateTracker::mutex`: creating a `VKBuffer` registers it
+   * through `resources.add_buffer()`, which takes that mutex, so reusing it here would self
+   * deadlock. This mutex is only ever held around the creation of a cache entry, never around
+   * anything that reaches the resource state tracker.
+   *
+   * Held only while an entry is being created; lookups stay lock free.
+   */
+  mutable std::mutex *dummy_resources_mutex_ = nullptr;
 
   /**
    * Lifetime of the device.
@@ -483,9 +502,16 @@ class VKDevice : public NonCopyable {
   /**
    * Get (creating on first use) the placeholder vertex buffer for a buffer-texture slot. Shared
    * by `dummy_texture_get()` and `dummy_texel_buffer_view_get()`, which wrap the same buffer in
-   * different ways.
+   * different ways. Takes `dummy_resources_mutex_` for the duration of the call.
    */
-  VertBuf *dummy_buffer_texture_ensure(eGPUSamplerFormat sampler_format) const;
+  VertBuf *dummy_buffer_texture_ensure_locked(eGPUSamplerFormat sampler_format) const;
+
+  /**
+   * Same as `dummy_buffer_texture_ensure_locked()`, but the caller must already own
+   * `dummy_resources_mutex_`. Exists so that `dummy_texture_get()` can create its buffer-texture
+   * placeholder from inside the critical section without re-entering it.
+   */
+  VertBuf *dummy_buffer_texture_ensure_unlocked(eGPUSamplerFormat sampler_format) const;
 
   /**
    * Cached results of `dummy_texture_get()`, owned by this device. Indexed by sampler format and
