@@ -18,6 +18,8 @@
 
 #include "GPU_capabilities.hh"
 #include "GPU_texture.hh"
+#include "GPU_vertex_buffer.hh"
+#include "GPU_vertex_format.hh"
 
 #include "BLI_math_matrix_types.hh"
 
@@ -43,9 +45,27 @@ void VKDevice::deinit()
   deinit_submission_pool();
 
   dummy_buffer.free();
-  if (dummy_texture_ != nullptr) {
-    GPU_texture_free(dummy_texture_);
-    dummy_texture_ = nullptr;
+  if (dummy_storage_buffer_ != nullptr) {
+    dummy_storage_buffer_->free();
+    delete dummy_storage_buffer_;
+    dummy_storage_buffer_ = nullptr;
+  }
+  if (dummy_uniform_buffer_ != nullptr) {
+    dummy_uniform_buffer_->free();
+    delete dummy_uniform_buffer_;
+    dummy_uniform_buffer_ = nullptr;
+  }
+  for (GPUTexture *&dummy_texture : dummy_textures_) {
+    if (dummy_texture != nullptr) {
+      GPU_texture_free(dummy_texture);
+      dummy_texture = nullptr;
+    }
+  }
+  for (VertBuf *&dummy_vertex_buffer : dummy_buffer_textures_) {
+    if (dummy_vertex_buffer != nullptr) {
+      GPU_vertbuf_discard(dummy_vertex_buffer);
+      dummy_vertex_buffer = nullptr;
+    }
   }
   samplers_.free();
 
@@ -232,23 +252,176 @@ void VKDevice::init_dummy_buffer()
   dummy_buffer.update_immediately(static_cast<void *>(data));
 }
 
-GPUTexture *VKDevice::dummy_texture_get() const
+GPUTexture *VKDevice::dummy_texture_get(eGPUTextureType type,
+                                        eGPUSamplerFormat sampler_format) const
 {
-  if (dummy_texture_ != nullptr) {
-    return dummy_texture_;
+  /* `eGPUTextureType` is a bit mask, so the cache is indexed by the raw value. Every combination
+   * used as a sampler type stays below `GPU_TEXTURE_BUFFER + 1`. */
+  static_assert(GPU_TEXTURE_CUBE_ARRAY < GPU_TEXTURE_BUFFER + 1,
+                "dummy texture cache is too small for the texture type values");
+  const size_t cache_index = size_t(sampler_format) * size_t(GPU_TEXTURE_BUFFER + 1) + size_t(type);
+  GPUTexture *dummy_tex = dummy_textures_[cache_index];
+  if (dummy_tex != nullptr) {
+    return dummy_tex;
   }
 
-  /* 1x1 opaque black 2D array texture. An array texture is used so the same resource can be
-   * bound to both arrayed and non-arrayed sampler declarations (`image_view_get` slices the
-   * layer range down to a single layer when the declaration is not arrayed).
-   *
-   * The initial pixels are deliberately not passed here: supplying them would upload through
-   * the render graph, which both requires a fully running context and injects a copy node into
-   * the graph at whatever point this is first called from. Only `vkCreateImage` is needed here,
+  /* The placeholder has to match the declared sampler type, otherwise its image view is
+   * incompatible with the descriptor and `vkUpdateDescriptorSets` fails validation. The format
+   * follows the sampler format so that a shader reading it never sees a type mismatch either. */
+  eGPUTextureFormat format = GPU_RGBA8;
+  switch (sampler_format) {
+    case GPU_SAMPLER_TYPE_FLOAT:
+      format = GPU_RGBA8;
+      break;
+    case GPU_SAMPLER_TYPE_INT:
+      format = GPU_RGBA8I;
+      break;
+    case GPU_SAMPLER_TYPE_UINT:
+      format = GPU_RGBA8UI;
+      break;
+    case GPU_SAMPLER_TYPE_DEPTH:
+      format = GPU_DEPTH32F_STENCIL8;
+      break;
+    default:
+      BLI_assert_unreachable();
+  }
+
+  /* The initial pixels are deliberately never passed: supplying them would upload through the
+   * render graph, which both requires a fully running context and injects a copy node into the
+   * graph at whatever point this is first called from. Only `vkCreateImage` is needed here,
    * matching `MTLContext::get_dummy_texture()` which also passes `nullptr`. */
-  dummy_texture_ = GPU_texture_create_2d_array(
-      "DummyTexture", 1, 1, 1, 1, GPU_RGBA8, GPU_TEXTURE_USAGE_GENERAL, nullptr);
-  return dummy_texture_;
+  const eGPUTextureUsage usage = GPU_TEXTURE_USAGE_GENERAL;
+  switch (type) {
+    case GPU_TEXTURE_1D:
+      dummy_tex = GPU_texture_create_1d("Dummy 1D", 1, 1, format, usage, nullptr);
+      break;
+    case GPU_TEXTURE_1D_ARRAY:
+      dummy_tex = GPU_texture_create_1d_array("Dummy 1DArray", 1, 1, 1, format, usage, nullptr);
+      break;
+    case GPU_TEXTURE_2D:
+      dummy_tex = GPU_texture_create_2d("Dummy 2D", 1, 1, 1, format, usage, nullptr);
+      break;
+    case GPU_TEXTURE_2D_ARRAY:
+      /* An array texture with a single layer serves both arrayed and non-arrayed declarations:
+       * `image_view_get` slices the layer range down for the latter. */
+      dummy_tex = GPU_texture_create_2d_array("Dummy 2DArray", 1, 1, 1, 1, format, usage, nullptr);
+      break;
+    case GPU_TEXTURE_3D:
+      dummy_tex = GPU_texture_create_3d("Dummy 3D", 1, 1, 1, 1, format, usage, nullptr);
+      break;
+    case GPU_TEXTURE_CUBE:
+      dummy_tex = GPU_texture_create_cube("Dummy Cube", 1, 1, format, usage, nullptr);
+      break;
+    case GPU_TEXTURE_CUBE_ARRAY:
+      dummy_tex = GPU_texture_create_cube_array("Dummy CubeArray", 1, 1, 1, format, usage, nullptr);
+      break;
+    case GPU_TEXTURE_BUFFER: {
+      /* A buffer texture wraps a vertex buffer rather than owning storage, so the vertex buffer
+       * has to outlive the texture and is cached on the device. */
+      VertBuf *vertex_buffer = dummy_buffer_texture_ensure(sampler_format);
+      if (vertex_buffer == nullptr) {
+        return nullptr;
+      }
+      dummy_tex = GPU_texture_create_from_vertbuf("Dummy TextureBuffer", vertex_buffer);
+      break;
+    }
+    default:
+      BLI_assert_msg(false, "Unrecognised texture type for dummy texture");
+      return nullptr;
+  }
+
+  dummy_textures_[cache_index] = dummy_tex;
+  return dummy_tex;
+}
+
+VertBuf *VKDevice::dummy_buffer_texture_ensure(eGPUSamplerFormat sampler_format) const
+{
+  VertBuf *&vertex_buffer = dummy_buffer_textures_[size_t(sampler_format)];
+  if (vertex_buffer != nullptr) {
+    return vertex_buffer;
+  }
+
+  GPUVertCompType comp_type = GPU_COMP_F32;
+  GPUVertFetchMode fetch_mode = GPU_FETCH_FLOAT;
+  switch (sampler_format) {
+    case GPU_SAMPLER_TYPE_FLOAT:
+    case GPU_SAMPLER_TYPE_DEPTH:
+      comp_type = GPU_COMP_F32;
+      fetch_mode = GPU_FETCH_FLOAT;
+      break;
+    case GPU_SAMPLER_TYPE_INT:
+      comp_type = GPU_COMP_I32;
+      fetch_mode = GPU_FETCH_INT;
+      break;
+    case GPU_SAMPLER_TYPE_UINT:
+      comp_type = GPU_COMP_U32;
+      fetch_mode = GPU_FETCH_INT;
+      break;
+    default:
+      BLI_assert_unreachable();
+  }
+
+  /* The format is rebuilt rather than shared, because the cached vertex buffer keeps a reference
+   * to it for the device lifetime. */
+  GPUVertFormat format = {};
+  GPU_vertformat_clear(&format);
+  GPU_vertformat_attr_add(&format, "dummy", comp_type, 4, fetch_mode);
+  vertex_buffer = GPU_vertbuf_create_with_format_ex(
+      format, GPU_USAGE_STATIC | GPU_USAGE_FLAG_BUFFER_TEXTURE_ONLY);
+  if (vertex_buffer == nullptr) {
+    return nullptr;
+  }
+  GPU_vertbuf_data_alloc(*vertex_buffer, 1);
+  return vertex_buffer;
+}
+
+VkBufferView VKDevice::dummy_texel_buffer_view_get(eGPUSamplerFormat sampler_format) const
+{
+  VertBuf *vertex_buffer = dummy_buffer_texture_ensure(sampler_format);
+  if (vertex_buffer == nullptr) {
+    return VK_NULL_HANDLE;
+  }
+  VKVertexBuffer *vk_vertex_buffer = unwrap(vertex_buffer);
+  vk_vertex_buffer->ensure_updated();
+  vk_vertex_buffer->ensure_buffer_view();
+  return vk_vertex_buffer->vk_buffer_view_get();
+}
+
+VkBuffer VKDevice::dummy_buffer_get(VkDescriptorType vk_descriptor_type) const
+{
+  VKBuffer **cached = nullptr;
+  VkBufferUsageFlags usage = 0;
+  switch (vk_descriptor_type) {
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+      cached = &dummy_storage_buffer_;
+      usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      break;
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      cached = &dummy_uniform_buffer_;
+      usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+      break;
+    default:
+      BLI_assert_unreachable();
+      return VK_NULL_HANDLE;
+  }
+
+  if (*cached != nullptr) {
+    return (*cached)->vk_handle();
+  }
+
+  /* Host visible so the contents are defined without a transfer; the size only has to satisfy the
+   * descriptor, which is never expected to be read through. */
+  VKBuffer *dummy_buffer = new VKBuffer();
+  if (!dummy_buffer->create(1024,
+                            usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                            VkMemoryPropertyFlags(0),
+                            VMA_ALLOCATION_CREATE_MAPPED_BIT)) {
+    delete dummy_buffer;
+    return VK_NULL_HANDLE;
+  }
+  *cached = dummy_buffer;
+  return dummy_buffer->vk_handle();
 }
 
 void VKDevice::init_glsl_patch()

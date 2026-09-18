@@ -8,12 +8,16 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 
 #include "BLI_task.h"
 #include "BLI_threads.h"
 #include "BLI_utility_mixins.hh"
 #include "BLI_vector.hh"
+
+#include "GPU_vertex_buffer.hh"
+#include "GPU_vertex_format.hh"
 
 #include "render_graph/vk_render_graph.hh"
 #include "render_graph/vk_resource_state_tracker.hh"
@@ -225,22 +229,45 @@ class VKDevice : public NonCopyable {
   /** Buffer to bind to unbound resource locations. */
   VKBuffer dummy_buffer;
   /**
-   * Texture to bind to unbound sampler locations.
+   * Texture to bind to unbound sampler locations, created on first request and cached per type
+   * and sampler format.
    *
    * A shader can declare a sampler that is never bound on the current drawing path (some
    * backends do not optimize out unused samplers, and several engine paths intentionally skip
    * optional textures). Vulkan requires every binding declared in the descriptor set layout to
-   * be written before the draw, so a neutral texture has to be supplied instead.
-   *
-   * This is a single 1x1 texture used for 2D and arrayed-2D samplers, which covers all engine
-   * cases seen so far. It is created once and kept alive for the device lifetime because the
-   * descriptor set can outlive the draw call that produced it.
+   * be written before the draw, so a neutral texture has to be supplied instead -- and it has to
+   * match the declared sampler type, otherwise the image view is incompatible with the
+   * descriptor and `vkUpdateDescriptorSets` fails validation. Declared samplers cover 1D, 2D,
+   * 3D, cube and arrayed variants, hence one placeholder per combination, as in
+   * `MTLContext::get_dummy_texture()`.
    *
    * Creation is deferred to the first request: allocating a texture uploads its initial pixels
    * through the render graph, which requires a context that does not exist yet while
-   * `VKDevice::init()` is running. Use `dummy_texture_get()` instead of touching this directly.
+   * `VKDevice::init()` is running. Use this instead of touching the cache directly.
    */
-  GPUTexture *dummy_texture_get() const;
+  GPUTexture *dummy_texture_get(eGPUTextureType type, eGPUSamplerFormat sampler_format) const;
+
+  /**
+   * Buffer view to bind to unbound buffer-texture samplers.
+   *
+   * Buffer textures are declared as samplers but occupy a uniform-texel-buffer descriptor slot,
+   * which the placeholder images returned by `dummy_texture_get()` cannot fill. This returns the
+   * view of a placeholder vertex buffer instead. Returns `VK_NULL_HANDLE` if the buffer could not
+   * be created.
+   */
+  VkBufferView dummy_texel_buffer_view_get(eGPUSamplerFormat sampler_format) const;
+
+  /**
+   * Buffer to bind to unbound storage or uniform buffer locations, created on first request and
+   * cached per usage.
+   *
+   * Same reasoning as `dummy_texture_get()`: a shader declares its resource interface at compile
+   * time, so a buffer that is not bound on the current drawing path still occupies a slot in the
+   * descriptor set layout. Vulkan requires every such slot to be written before the draw, so a
+   * neutral buffer has to be supplied. Returns `VK_NULL_HANDLE` if the buffer could not be
+   * created.
+   */
+  VkBuffer dummy_buffer_get(VkDescriptorType vk_descriptor_type) const;
 
   /**
    * This struct contains the functions pointer to extension provided functions.
@@ -445,11 +472,36 @@ class VKDevice : public NonCopyable {
   void init_dummy_buffer();
 
   /**
-   * Cached result of `dummy_texture_get()`, owned by this device. `mutable` because the cache is
-   * filled on first use, which happens through the `const VKDevice &` handed to the drawing
-   * paths; it does not change the observable state of the device.
+   * Get (creating on first use) the placeholder vertex buffer for a buffer-texture slot. Shared
+   * by `dummy_texture_get()` and `dummy_texel_buffer_view_get()`, which wrap the same buffer in
+   * different ways.
    */
-  mutable GPUTexture *dummy_texture_ = nullptr;
+  VertBuf *dummy_buffer_texture_ensure(eGPUSamplerFormat sampler_format) const;
+
+  /**
+   * Cached results of `dummy_texture_get()`, owned by this device. Indexed by sampler format and
+   * texture type, mirroring `MTLContext::dummy_textures_`. `mutable` because the cache is filled
+   * on first use, which happens through the `const VKDevice &` handed to the drawing paths; it
+   * does not change the observable state of the device.
+   */
+  mutable std::array<GPUTexture *,
+                     size_t(GPU_SAMPLER_TYPE_MAX) * size_t(GPU_TEXTURE_BUFFER + 1)>
+      dummy_textures_ = {};
+
+  /**
+   * Vertex buffers backing the buffer-type placeholders, one per sampler format. They are kept
+   * alive for the device lifetime because `GPU_texture_create_from_vertbuf` wraps the buffer
+   * rather than copying it.
+   */
+  mutable std::array<blender::gpu::VertBuf *, size_t(GPU_SAMPLER_TYPE_MAX)> dummy_buffer_textures_ =
+      {};
+
+  /**
+   * Cached storage and uniform placeholder buffers. `mutable` for the same reason as the texture
+   * cache.
+   */
+  mutable VKBuffer *dummy_storage_buffer_ = nullptr;
+  mutable VKBuffer *dummy_uniform_buffer_ = nullptr;
 
   /* During initialization the backend requires access to update the workarounds. */
   friend VKBackend;

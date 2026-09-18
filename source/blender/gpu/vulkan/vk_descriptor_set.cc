@@ -17,6 +17,126 @@
 
 namespace blender::gpu {
 
+/** Size of the neutral buffers bound to unbound storage and uniform buffer slots. Only has to
+ * satisfy the descriptor; the contents are never expected to be read through. */
+static constexpr VkDeviceSize DUMMY_BUFFER_SIZE = 1024;
+
+/**
+ * Map a declared sampler type onto the placeholder texture type it needs.
+ *
+ * Used when a sampler turns out to be unbound at draw time: the placeholder has to match the
+ * declared type, otherwise its image view is incompatible with the descriptor and
+ * `vkUpdateDescriptorSets` fails validation.
+ */
+static eGPUTextureType to_dummy_texture_type(const shader::ImageType image_type)
+{
+  switch (image_type) {
+    case shader::ImageType::FLOAT_1D:
+    case shader::ImageType::INT_1D:
+    case shader::ImageType::UINT_1D:
+      return GPU_TEXTURE_1D;
+    case shader::ImageType::FLOAT_1D_ARRAY:
+    case shader::ImageType::INT_1D_ARRAY:
+    case shader::ImageType::UINT_1D_ARRAY:
+      return GPU_TEXTURE_1D_ARRAY;
+    case shader::ImageType::FLOAT_2D:
+    case shader::ImageType::INT_2D:
+    case shader::ImageType::UINT_2D:
+    case shader::ImageType::UINT_2D_ATOMIC:
+    case shader::ImageType::INT_2D_ATOMIC:
+    case shader::ImageType::SHADOW_2D:
+    case shader::ImageType::DEPTH_2D:
+      return GPU_TEXTURE_2D;
+    case shader::ImageType::FLOAT_2D_ARRAY:
+    case shader::ImageType::INT_2D_ARRAY:
+    case shader::ImageType::UINT_2D_ARRAY:
+    case shader::ImageType::UINT_2D_ARRAY_ATOMIC:
+    case shader::ImageType::INT_2D_ARRAY_ATOMIC:
+    case shader::ImageType::SHADOW_2D_ARRAY:
+    case shader::ImageType::DEPTH_2D_ARRAY:
+      return GPU_TEXTURE_2D_ARRAY;
+    case shader::ImageType::FLOAT_3D:
+    case shader::ImageType::INT_3D:
+    case shader::ImageType::UINT_3D:
+    case shader::ImageType::UINT_3D_ATOMIC:
+    case shader::ImageType::INT_3D_ATOMIC:
+      return GPU_TEXTURE_3D;
+    case shader::ImageType::FLOAT_CUBE:
+    case shader::ImageType::INT_CUBE:
+    case shader::ImageType::UINT_CUBE:
+    case shader::ImageType::SHADOW_CUBE:
+    case shader::ImageType::DEPTH_CUBE:
+      return GPU_TEXTURE_CUBE;
+    case shader::ImageType::FLOAT_CUBE_ARRAY:
+    case shader::ImageType::INT_CUBE_ARRAY:
+    case shader::ImageType::UINT_CUBE_ARRAY:
+    case shader::ImageType::SHADOW_CUBE_ARRAY:
+    case shader::ImageType::DEPTH_CUBE_ARRAY:
+      return GPU_TEXTURE_CUBE_ARRAY;
+    default:
+      BLI_assert_unreachable();
+      return GPU_TEXTURE_2D;
+  }
+}
+
+/**
+ * Format a placeholder sampler reads as. Mirrors `MTLContext::get_dummy_texture()`, which picks
+ * the texture format from the sampler format for the same reason.
+ */
+static eGPUSamplerFormat to_dummy_sampler_format(const shader::ImageType image_type)
+{
+  switch (image_type) {
+    case shader::ImageType::INT_1D:
+    case shader::ImageType::INT_1D_ARRAY:
+    case shader::ImageType::INT_2D:
+    case shader::ImageType::INT_2D_ARRAY:
+    case shader::ImageType::INT_3D:
+    case shader::ImageType::INT_CUBE:
+    case shader::ImageType::INT_CUBE_ARRAY:
+    case shader::ImageType::INT_2D_ATOMIC:
+    case shader::ImageType::INT_2D_ARRAY_ATOMIC:
+    case shader::ImageType::INT_3D_ATOMIC:
+      return GPU_SAMPLER_TYPE_INT;
+    case shader::ImageType::UINT_1D:
+    case shader::ImageType::UINT_1D_ARRAY:
+    case shader::ImageType::UINT_2D:
+    case shader::ImageType::UINT_2D_ARRAY:
+    case shader::ImageType::UINT_3D:
+    case shader::ImageType::UINT_CUBE:
+    case shader::ImageType::UINT_CUBE_ARRAY:
+    case shader::ImageType::UINT_2D_ATOMIC:
+    case shader::ImageType::UINT_2D_ARRAY_ATOMIC:
+    case shader::ImageType::UINT_3D_ATOMIC:
+      return GPU_SAMPLER_TYPE_UINT;
+    case shader::ImageType::SHADOW_2D:
+    case shader::ImageType::SHADOW_2D_ARRAY:
+    case shader::ImageType::SHADOW_CUBE:
+    case shader::ImageType::SHADOW_CUBE_ARRAY:
+    case shader::ImageType::DEPTH_2D:
+    case shader::ImageType::DEPTH_2D_ARRAY:
+    case shader::ImageType::DEPTH_CUBE:
+    case shader::ImageType::DEPTH_CUBE_ARRAY:
+      return GPU_SAMPLER_TYPE_DEPTH;
+    default:
+      return GPU_SAMPLER_TYPE_FLOAT;
+  }
+}
+
+/**
+ * Whether a declared sampler is a buffer texture.
+ *
+ * Buffer textures are represented as `VKBindType::SAMPLER` but their descriptor set layout slot
+ * is `VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER`, so they cannot be satisfied by the placeholder
+ * images used for ordinary samplers.
+ */
+static bool is_buffer_sampler(const shader::ImageType image_type)
+{
+  return ELEM(image_type,
+              shader::ImageType::FLOAT_BUFFER,
+              shader::ImageType::INT_BUFFER,
+              shader::ImageType::UINT_BUFFER);
+}
+
 void VKDescriptorSetTracker::bind_buffer(VkDescriptorType vk_descriptor_type,
                                          VkBuffer vk_buffer,
                                          VkDeviceSize buffer_offset,
@@ -78,8 +198,11 @@ void VKDescriptorSetTracker::bind_image_resource(const VKStateManager &state_man
   VKTexture *texture_ptr = state_manager.images_.get(resource_binding.binding);
   if (texture_ptr == nullptr) {
     /* Image was not bound on this drawing path while the shader still declares it. There is no
-     * meaningful stand-in for a storage image, so skip the binding. Unlike the sampler case this
-     * leaves the descriptor undefined, but the alternative is dereferencing a null pointer. */
+     * placeholder storage image that could stand in for it (a write to it would be silently
+     * discarded, and its format has to match the declared image type), so the binding stays
+     * unwritten and the descriptor is undefined. This is a known gap: unlike the sampler case it
+     * has not been observed in practice, because images declared via `ADDITIONAL_INFO` are also
+     * bound by the paths that use them. */
     return;
   }
   VKTexture &texture = *texture_ptr;
@@ -155,9 +278,26 @@ void VKDescriptorSetTracker::bind_texture_resource(const VKDevice &device,
        * shader whose statically declared sampler list is much larger than what that path binds).
        * Vulkan requires every binding present in the descriptor set layout to be written before
        * the draw, otherwise the descriptor stays undefined, which is undefined behaviour and used
-       * to crash while reading the unbound resource. Bind a neutral texture so the layout is
-       * always satisfied. */
-      GPUTexture *dummy_texture = device.dummy_texture_get();
+       * to crash while reading the unbound resource. Bind a neutral resource so the layout is
+       * always satisfied.
+       *
+       * Which neutral resource is required depends on the declared sampler type: buffer textures
+       * occupy a uniform-texel-buffer slot, while everything else is a combined image sampler
+       * whose placeholder has to match the declared dimensionality. */
+      const shader::ImageType image_type = resource_binding.image_type;
+      if (is_buffer_sampler(image_type)) {
+        /* Buffer textures occupy a uniform-texel-buffer slot rather than a combined image
+         * sampler, so the placeholder image cannot be used here. The device owns a matching
+         * placeholder buffer view. */
+        VkBufferView dummy_view = device.dummy_texel_buffer_view_get(
+            to_dummy_sampler_format(image_type));
+        if (dummy_view != VK_NULL_HANDLE) {
+          bind_texel_buffer(dummy_view, resource_binding.location);
+        }
+        break;
+      }
+      GPUTexture *dummy_texture = device.dummy_texture_get(to_dummy_texture_type(image_type),
+                                                           to_dummy_sampler_format(image_type));
       if (dummy_texture == nullptr) {
         break;
       }
@@ -249,6 +389,7 @@ void VKDescriptorSetTracker::bind_input_attachment_resource(
 }
 
 void VKDescriptorSetTracker::bind_storage_buffer_resource(
+    const VKDevice &device,
     const VKStateManager &state_manager,
     const VKResourceBinding &resource_binding,
     render_graph::VKResourceAccessInfo &access_info)
@@ -293,9 +434,19 @@ void VKDescriptorSetTracker::bind_storage_buffer_resource(
       break;
     }
     case BindSpaceStorageBuffers::Type::Unused: {
-      /* The storage buffer was not bound on this drawing path while the shader still declares
-       * it. Binding `VK_NULL_HANDLE` would produce an invalid descriptor, so skip the binding
-       * instead. */
+      /* The storage buffer was not bound on this drawing path while the shader still declares it.
+       * Vulkan requires the slot to be written, so bind a neutral buffer rather than leaving the
+       * descriptor undefined. */
+      VkBuffer dummy_buffer = device.dummy_buffer_get(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+      if (dummy_buffer == VK_NULL_HANDLE) {
+        return;
+      }
+      bind_buffer(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  dummy_buffer,
+                  0,
+                  DUMMY_BUFFER_SIZE,
+                  resource_binding.location);
+      access_info.buffers.append({dummy_buffer, resource_binding.access_mask});
       return;
     }
   }
@@ -309,6 +460,7 @@ void VKDescriptorSetTracker::bind_storage_buffer_resource(
 }
 
 void VKDescriptorSetTracker::bind_uniform_buffer_resource(
+    const VKDevice &device,
     const VKStateManager &state_manager,
     const VKResourceBinding &resource_binding,
     render_graph::VKResourceAccessInfo &access_info)
@@ -317,7 +469,18 @@ void VKDescriptorSetTracker::bind_uniform_buffer_resource(
       resource_binding.binding);
   if (uniform_buffer_ptr == nullptr) {
     /* The uniform buffer was not bound on this drawing path while the shader still declares it.
-     * Skipping leaves the descriptor undefined, but the alternative is a null dereference. */
+     * Vulkan requires the slot to be written, so bind a neutral buffer rather than leaving the
+     * descriptor undefined. */
+    VkBuffer dummy_buffer = device.dummy_buffer_get(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+    if (dummy_buffer == VK_NULL_HANDLE) {
+      return;
+    }
+    bind_buffer(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                dummy_buffer,
+                0,
+                DUMMY_BUFFER_SIZE,
+                resource_binding.location);
+    access_info.buffers.append({dummy_buffer, resource_binding.access_mask});
     return;
   }
   VKUniformBuffer &uniform_buffer = *uniform_buffer_ptr;
@@ -361,11 +524,11 @@ void VKDescriptorSetTracker::bind_shader_resources(const VKDevice &device,
 
     switch (resource_binding.bind_type) {
       case VKBindType::UNIFORM_BUFFER:
-        bind_uniform_buffer_resource(state_manager, resource_binding, access_info);
+        bind_uniform_buffer_resource(device, state_manager, resource_binding, access_info);
         break;
 
       case VKBindType::STORAGE_BUFFER:
-        bind_storage_buffer_resource(state_manager, resource_binding, access_info);
+        bind_storage_buffer_resource(device, state_manager, resource_binding, access_info);
         break;
 
       case VKBindType::SAMPLER:
