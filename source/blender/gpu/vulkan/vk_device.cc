@@ -17,6 +17,7 @@
 #include "vk_vertex_buffer.hh"
 
 #include "GPU_capabilities.hh"
+#include "GPU_texture.hh"
 
 #include "BLI_math_matrix_types.hh"
 
@@ -42,6 +43,10 @@ void VKDevice::deinit()
   deinit_submission_pool();
 
   dummy_buffer.free();
+  if (dummy_texture_ != nullptr) {
+    GPU_texture_free(dummy_texture_);
+    dummy_texture_ = nullptr;
+  }
   samplers_.free();
 
   {
@@ -108,6 +113,10 @@ void VKDevice::init(void *ghost_context)
 
   samplers_.init();
   init_dummy_buffer();
+  /* NOTE: The dummy texture is created lazily on first use. Creating a texture uploads its
+   * initial pixels through the render graph, which needs a context that does not exist yet at
+   * this point (`context_alloc()` constructs the first context only after `device.init()`
+   * returns). See `dummy_texture_get()`. */
 
   debug::object_label(vk_handle(), "LogicalDevice");
   debug::object_label(queue_get(), "GenericQueue");
@@ -221,6 +230,25 @@ void VKDevice::init_dummy_buffer()
   float data[16] = {
       0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   dummy_buffer.update_immediately(static_cast<void *>(data));
+}
+
+GPUTexture *VKDevice::dummy_texture_get() const
+{
+  if (dummy_texture_ != nullptr) {
+    return dummy_texture_;
+  }
+
+  /* 1x1 opaque black 2D array texture. An array texture is used so the same resource can be
+   * bound to both arrayed and non-arrayed sampler declarations (`image_view_get` slices the
+   * layer range down to a single layer when the declaration is not arrayed).
+   *
+   * The initial pixels are deliberately not passed here: supplying them would upload through
+   * the render graph, which both requires a fully running context and injects a copy node into
+   * the graph at whatever point this is first called from. Only `vkCreateImage` is needed here,
+   * matching `MTLContext::get_dummy_texture()` which also passes `nullptr`. */
+  dummy_texture_ = GPU_texture_create_2d_array(
+      "DummyTexture", 1, 1, 1, 1, GPU_RGBA8, GPU_TEXTURE_USAGE_GENERAL, nullptr);
+  return dummy_texture_;
 }
 
 void VKDevice::init_glsl_patch()

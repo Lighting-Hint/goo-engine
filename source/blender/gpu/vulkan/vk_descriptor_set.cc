@@ -75,7 +75,14 @@ void VKDescriptorSetTracker::bind_image_resource(const VKStateManager &state_man
                                                  const VKResourceBinding &resource_binding,
                                                  render_graph::VKResourceAccessInfo &access_info)
 {
-  VKTexture &texture = *state_manager.images_.get(resource_binding.binding);
+  VKTexture *texture_ptr = state_manager.images_.get(resource_binding.binding);
+  if (texture_ptr == nullptr) {
+    /* Image was not bound on this drawing path while the shader still declares it. There is no
+     * meaningful stand-in for a storage image, so skip the binding. Unlike the sampler case this
+     * leaves the descriptor undefined, but the alternative is dereferencing a null pointer. */
+    return;
+  }
+  VKTexture &texture = *texture_ptr;
   bind_image(
       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
       VK_NULL_HANDLE,
@@ -141,7 +148,37 @@ void VKDescriptorSetTracker::bind_texture_resource(const VKDevice &device,
       break;
     }
     case BindSpaceTextures::Type::Unused: {
-      BLI_assert_unreachable();
+      /* The shader declares this sampler but nothing was bound to it on this drawing path.
+       *
+       * Some backends do not optimize out unused samplers, and several engine code paths
+       * intentionally skip optional textures (for example world light-baking renders a material
+       * shader whose statically declared sampler list is much larger than what that path binds).
+       * Vulkan requires every binding present in the descriptor set layout to be written before
+       * the draw, otherwise the descriptor stays undefined, which is undefined behaviour and used
+       * to crash while reading the unbound resource. Bind a neutral texture so the layout is
+       * always satisfied. */
+      GPUTexture *dummy_texture = device.dummy_texture_get();
+      if (dummy_texture == nullptr) {
+        break;
+      }
+      /* Two unwrap steps are required, as elsewhere in this backend (see `vk_framebuffer.cc` and
+       * `vk_context.cc`): `GPUTexture` is only an opaque forward declaration, not a base class, so
+       * no single cast reaches `VKTexture`. The first unwrap turns the opaque handle into a
+       * `Texture *`, the second reaches the backend type. */
+      VKTexture *filler_texture = unwrap(unwrap(dummy_texture));
+      const VKSampler &sampler = device.samplers().get(GPUSamplerState::default_sampler());
+      bind_image(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                 sampler.vk_handle(),
+                 filler_texture->image_view_get(resource_binding.arrayed, VKImageViewFlags::DEFAULT)
+                     .vk_handle(),
+                 VK_IMAGE_LAYOUT_GENERAL,
+                 resource_binding.location);
+      access_info.images.append({filler_texture->vk_image_handle(),
+                                 resource_binding.access_mask,
+                                 to_vk_image_aspect_flag_bits(filler_texture->device_format_get()),
+                                 0,
+                                 VK_REMAINING_ARRAY_LAYERS});
+      break;
     }
   }
 }
@@ -154,9 +191,11 @@ void VKDescriptorSetTracker::bind_input_attachment_resource(
 {
   const bool supports_local_read = !device.workarounds_get().dynamic_rendering_local_read;
   if (supports_local_read) {
-    VKTexture *texture = static_cast<VKTexture *>(
-        state_manager.images_.get(resource_binding.binding));
-    BLI_assert(texture);
+    VKTexture *texture = state_manager.images_.get(resource_binding.binding);
+    if (texture == nullptr) {
+      /* See `bind_image_resource` for why the binding is skipped. */
+      return;
+    }
     bind_image(VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
                VK_NULL_HANDLE,
                texture->image_view_get(resource_binding.arrayed, VKImageViewFlags::NO_SWIZZLING)
@@ -172,9 +211,12 @@ void VKDescriptorSetTracker::bind_input_attachment_resource(
   else {
     bool supports_dynamic_rendering = !device.workarounds_get().dynamic_rendering;
     const BindSpaceTextures::Elem &elem = state_manager.textures_.get(resource_binding.binding);
+    if (elem.resource_type != BindSpaceTextures::Type::Texture || elem.resource == nullptr) {
+      /* The input attachment was not bound on this drawing path. Nothing sensible can be bound
+       * in its place, so skip it rather than dereferencing a null resource. */
+      return;
+    }
     VKTexture *texture = static_cast<VKTexture *>(elem.resource);
-    BLI_assert(texture);
-    BLI_assert(elem.resource_type == BindSpaceTextures::Type::Texture);
     if (supports_dynamic_rendering) {
       const VKSampler &sampler = device.samplers().get(elem.sampler);
       bind_image(
@@ -251,7 +293,10 @@ void VKDescriptorSetTracker::bind_storage_buffer_resource(
       break;
     }
     case BindSpaceStorageBuffers::Type::Unused: {
-      BLI_assert_unreachable();
+      /* The storage buffer was not bound on this drawing path while the shader still declares
+       * it. Binding `VK_NULL_HANDLE` would produce an invalid descriptor, so skip the binding
+       * instead. */
+      return;
     }
   }
 
@@ -268,7 +313,14 @@ void VKDescriptorSetTracker::bind_uniform_buffer_resource(
     const VKResourceBinding &resource_binding,
     render_graph::VKResourceAccessInfo &access_info)
 {
-  VKUniformBuffer &uniform_buffer = *state_manager.uniform_buffers_.get(resource_binding.binding);
+  VKUniformBuffer *uniform_buffer_ptr = state_manager.uniform_buffers_.get(
+      resource_binding.binding);
+  if (uniform_buffer_ptr == nullptr) {
+    /* The uniform buffer was not bound on this drawing path while the shader still declares it.
+     * Skipping leaves the descriptor undefined, but the alternative is a null dereference. */
+    return;
+  }
+  VKUniformBuffer &uniform_buffer = *uniform_buffer_ptr;
   uniform_buffer.ensure_updated();
   bind_buffer(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
               uniform_buffer.vk_handle(),

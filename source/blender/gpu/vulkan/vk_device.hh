@@ -224,6 +224,23 @@ class VKDevice : public NonCopyable {
   VKPipelinePool pipelines;
   /** Buffer to bind to unbound resource locations. */
   VKBuffer dummy_buffer;
+  /**
+   * Texture to bind to unbound sampler locations.
+   *
+   * A shader can declare a sampler that is never bound on the current drawing path (some
+   * backends do not optimize out unused samplers, and several engine paths intentionally skip
+   * optional textures). Vulkan requires every binding declared in the descriptor set layout to
+   * be written before the draw, so a neutral texture has to be supplied instead.
+   *
+   * This is a single 1x1 texture used for 2D and arrayed-2D samplers, which covers all engine
+   * cases seen so far. It is created once and kept alive for the device lifetime because the
+   * descriptor set can outlive the draw call that produced it.
+   *
+   * Creation is deferred to the first request: allocating a texture uploads its initial pixels
+   * through the render graph, which requires a context that does not exist yet while
+   * `VKDevice::init()` is running. Use `dummy_texture_get()` instead of touching this directly.
+   */
+  GPUTexture *dummy_texture_get() const;
 
   /**
    * This struct contains the functions pointer to extension provided functions.
@@ -426,6 +443,13 @@ class VKDevice : public NonCopyable {
    * Initialize a dummy buffer that can be bound for missing attributes.
    */
   void init_dummy_buffer();
+
+  /**
+   * Cached result of `dummy_texture_get()`, owned by this device. `mutable` because the cache is
+   * filled on first use, which happens through the `const VKDevice &` handed to the drawing
+   * paths; it does not change the observable state of the device.
+   */
+  mutable GPUTexture *dummy_texture_ = nullptr;
 
   /* During initialization the backend requires access to update the workarounds. */
   friend VKBackend;
