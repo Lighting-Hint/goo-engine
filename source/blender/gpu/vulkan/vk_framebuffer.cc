@@ -712,7 +712,6 @@ void VKFrameBuffer::rendering_ensure_render_pass(VKContext &context)
     if (attachment.tex == nullptr) {
       continue;
     }
-    has_depth_attachment = true;
     bool is_stencil_attachment = depth_attachment_index == GPU_FB_DEPTH_STENCIL_ATTACHMENT;
     VKTexture &depth_texture = *unwrap(unwrap(attachment.tex));
     BLI_assert_msg(depth_texture.usage_get() & GPU_TEXTURE_USAGE_ATTACHMENT,
@@ -727,7 +726,8 @@ void VKFrameBuffer::rendering_ensure_render_pass(VKContext &context)
     GPUAttachmentState attachment_state = attachment_states_[GPU_FB_DEPTH_ATTACHMENT];
     VkImageView depth_image_view = VK_NULL_HANDLE;
     uint32_t layer_base = max_ii(attachment.layer, 0);
-    if (attachment_state == GPU_ATTACHMENT_WRITE) {
+    bool has_image = depth_texture.vk_image_handle() != VK_NULL_HANDLE;
+    if (has_image && attachment_state == GPU_ATTACHMENT_WRITE) {
       VKImageViewInfo image_view_info = {eImageViewUsage::Attachment,
                                          IndexRange(layer_base, 1),
                                          IndexRange(attachment.mip, 1),
@@ -736,12 +736,20 @@ void VKFrameBuffer::rendering_ensure_render_pass(VKContext &context)
                                          false,
                                          VKImageViewArrayed::DONT_CARE};
       const VKImageView &image_view = depth_texture.image_view_get(image_view_info);
-      /* See the color attachment loop above for why a failed view is skipped. */
-      if (!image_view.is_valid()) {
-        continue;
+      has_image = image_view.is_valid();
+      if (has_image) {
+        depth_image_view = image_view.vk_handle();
       }
-      depth_image_view = image_view.vk_handle();
     }
+    /* A depth attachment whose image or view is gone is left out of the render pass entirely.
+     * Unlike the color attachment loop, the depth reference is a single slot that is only
+     * published when a valid attachment was appended, so there is no index alignment to
+     * preserve. Leaving `has_depth_attachment` false makes the subpass omit the depth-stencil
+     * reference, which is the valid way to express a pass without depth. */
+    if (!has_image) {
+      continue;
+    }
+    has_depth_attachment = true;
     VkAttachmentDescription vk_attachment_description = {};
     vk_attachment_description.format = to_vk_format(depth_texture.device_format_get());
     vk_attachment_description.samples = VK_SAMPLE_COUNT_1_BIT;
