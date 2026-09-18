@@ -306,7 +306,14 @@ void VKDescriptorSetTracker::bind_texture_resource(const VKDevice &device,
        * no single cast reaches `VKTexture`. The first unwrap turns the opaque handle into a
        * `Texture *`, the second reaches the backend type. */
       VKTexture *filler_texture = unwrap(unwrap(dummy_texture));
-      const VKSampler &sampler = device.samplers().get(GPUSamplerState::default_sampler());
+      const VKSampler &sampler = device.samplers().get(
+          ELEM(image_type,
+               shader::ImageType::SHADOW_2D,
+               shader::ImageType::SHADOW_2D_ARRAY,
+               shader::ImageType::SHADOW_CUBE,
+               shader::ImageType::SHADOW_CUBE_ARRAY) ?
+              GPUSamplerState::compare_sampler() :
+              GPUSamplerState::default_sampler());
       bind_image(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                  sampler.vk_handle(),
                  filler_texture->image_view_get(resource_binding.arrayed, VKImageViewFlags::DEFAULT)
